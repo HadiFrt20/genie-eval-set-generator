@@ -1,0 +1,13 @@
+command: ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+env:
+  # Injected by the Databricks Asset Bundle at deploy (databricks.yml). This placeholder is only a
+  # fallback for un-bundled local runs — set it to your deployed notebook path.
+  - name: NOTEBOOK_PATH
+    value: /Workspace/Shared/genie_eval_set_generator/genie_eval_set_generator
+  - name: DEFAULT_GENERATOR_ENDPOINT
+    value: databricks-llama-4-maverick
+  - name: DEFAULT_JUDGE_ENDPOINT
+    value: databricks-claude-sonnet-4-5
+  - name: DEFAULT_EMBEDDING_ENDPOINT
+    value: databricks-bge-large-en

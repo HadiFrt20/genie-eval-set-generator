@@ -1,0 +1,10 @@
+# Default MLflow experiment for eval runs. Lives under the deployer's home so
+# we don't need extra ACL setup. The Configure page lets users override the
+# experiment path per run if they want a different one.
+#
+# Each notebook run logs four child runs into this experiment:
+#   eval_set_quality, eval_set_realism, eval_set_stability, genie_regression
+resources:
+  experiments:
+    genie_eval_runs:
+      name: /Users/${workspace.current_user.userName}/genie_eval_runs

@@ -1,0 +1,23 @@
+# Databricks App resource. Source code lives at ../app (sibling of databricks.yml).
+# Env vars set here override the static values in app/app.yaml — important for
+# NOTEBOOK_PATH which depends on where the bundle synced the notebook.
+resources:
+  apps:
+    genie_eval_app:
+      name: genie-eval-generator
+      source_code_path: ../app
+      description: >-
+        Genie Eval Set Generator — synthetic NL→SQL eval sets for Genie spaces
+        with a 6-axis MLflow scorecard.
+      config:
+        env:
+          - name: NOTEBOOK_PATH
+            value: ${workspace.file_path}/genie_eval_set_generator
+          - name: DEFAULT_GENERATOR_ENDPOINT
+            value: databricks-llama-4-maverick
+          - name: DEFAULT_JUDGE_ENDPOINT
+            value: databricks-claude-sonnet-4-5
+          - name: DEFAULT_EMBEDDING_ENDPOINT
+            value: databricks-bge-large-en
+          - name: DEFAULT_OUTPUT_CATALOG
+            value: ${var.output_catalog}

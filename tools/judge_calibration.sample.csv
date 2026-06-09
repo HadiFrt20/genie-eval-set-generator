@@ -1,0 +1,7 @@
+item_id,judge,judge_label,human_label
+q1,question_clarity,pass,pass
+q2,question_clarity,pass,fail
+q3,question_clarity,fail,fail
+q4,answer_quality,pass,pass
+q5,answer_quality,fail,pass
+q6,answer_quality,pass,pass

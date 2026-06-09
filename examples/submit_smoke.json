@@ -1,0 +1,38 @@
+{
+  "_comment": "Smoke run: M=1 stability disabled, fast iteration. Replace genie_space_id, hosts, and uc_catalog/schema for your workspace.",
+  "run_name": "genie_eval_smoke",
+  "tasks": [
+    {
+      "task_key": "eval",
+      "notebook_task": {
+        "notebook_path": "/Users/<you>@databricks.com/genie_eval_set_generator",
+        "source": "WORKSPACE",
+        "base_parameters": {
+          "uc_catalog": "<your_catalog>",
+          "uc_schema": "<your_schema>",
+          "genie_space_id": "<32-char hex from data-rooms URL>",
+          "genie_tables": "",
+          "mlflow_experiment_path": "/Users/<you>@databricks.com/genie_eval",
+          "generator_endpoint": "databricks-llama-4-maverick",
+          "judge_endpoint": "databricks-claude-sonnet-4-5",
+          "ai_gateway_base_url": "https://<your-workspace>.cloud.databricks.com/serving-endpoints",
+          "questions_per_table": "10",
+          "min_hard_per_table": "5",
+          "max_distinct_values_per_column": "30",
+          "extra_space_instructions": "",
+          "embedding_endpoint": "databricks-bge-large-en",
+          "stability_runs": "1",
+          "include_historical_in_context": "false",
+          "run_prompt_optimization": "false"
+        }
+      },
+      "environment_key": "env"
+    }
+  ],
+  "environments": [
+    {
+      "environment_key": "env",
+      "spec": {"client": "3", "environment_version": "3"}
+    }
+  ]
+}

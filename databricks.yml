@@ -1,0 +1,46 @@
+# Databricks Asset Bundle for the Genie Eval Set Generator.
+# See https://docs.databricks.com/dev-tools/bundles/index.html
+#
+# Install:
+#   databricks auth login --host https://<your-workspace>.cloud.databricks.com
+#   databricks bundle deploy --var=output_catalog=<your_catalog>
+#
+# What this bundle does:
+#   - Uploads the notebook (genie_eval_set_generator.py) to the workspace
+#   - Creates UC schema <output_catalog>.genie_eval (where the eval-set,
+#     runs-index, and prompt registry live)
+#   - Creates an MLflow experiment under your home directory
+#   - Deploys the React + FastAPI app at app/
+#
+# What it does NOT do (manual checklist after deploy):
+#   - Grant CAN_USE on serving endpoints (databricks-llama-4-maverick,
+#     databricks-claude-sonnet-4-5, databricks-bge-large-en) to the app SP
+#   - Grant CAN_USE on a SQL warehouse to the app SP
+#   - Grant USE CATALOG / MODIFY on <output_catalog> to the app SP
+# See README.md for the full permissions checklist.
+
+bundle:
+  name: genie-eval-set-generator
+
+variables:
+  output_catalog:
+    description: >-
+      UC catalog where the eval-set tables, runs-index, and prompt registry will
+      live. Set with --var=output_catalog=<your_catalog>. No default — you must
+      pick one.
+
+# Sync the notebook source into the workspace alongside the app source.
+# Notebooks land at ${workspace.file_path}/genie_eval_set_generator (no .py).
+sync:
+  include:
+    - genie_eval_set_generator.py
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    mode: development
+    default: true
+  prod:
+    mode: production

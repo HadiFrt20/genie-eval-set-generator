@@ -1,0 +1,11 @@
+# UC schema where eval-set, runs-index, and prompt registry live.
+# Catalog is parameterized — set via `databricks bundle deploy --var=output_catalog=<your_catalog>`.
+resources:
+  schemas:
+    genie_eval:
+      catalog_name: ${var.output_catalog}
+      name: genie_eval
+      comment: >-
+        Genie eval-set generator output schema. Holds genie_eval_set,
+        genie_eval_runs (per-run regression results), and genie_eval_runs_index
+        (the run history table the app reads on /api/eval-runs-index).
