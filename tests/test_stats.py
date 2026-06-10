@@ -97,8 +97,49 @@ def canon_cell(v) -> str:
     return s
 
 
-def canon_row(row):
-    return tuple(sorted(canon_cell(v) for v in (row or [])))
+def cells_close(a, b):
+    if a == b:
+        return True
+    try:
+        da, db = Decimal(a), Decimal(b)
+    except Exception:
+        return False
+    diff = abs(da - db)
+    if diff <= Decimal("1e-9"):
+        return True
+    scale = max(abs(da), abs(db))
+    return (diff / scale) <= Decimal("0.001")
+
+
+def match_with_permutation(E, G, tolerant):
+    from itertools import permutations
+    ncols = len(E[0])
+    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
+        return False
+    if ncols > 7:
+        return Counter(tuple(sorted(r)) for r in E) == Counter(tuple(sorted(r)) for r in G)
+    ce = Counter(E)
+    for p in permutations(range(ncols)):
+        Gp = [tuple(g[i] for i in p) for g in G]
+        if not tolerant:
+            if ce == Counter(Gp):
+                return True
+        else:
+            used = [False] * len(Gp)
+            ok = True
+            for e in E:
+                hit = False
+                for j, g in enumerate(Gp):
+                    if not used[j] and all(cells_close(x, y) for x, y in zip(e, g)):
+                        used[j] = True
+                        hit = True
+                        break
+                if not hit:
+                    ok = False
+                    break
+            if ok:
+                return True
+    return False
 
 
 def rows_match(expected_rows, genie_rows, row_cap=50):
@@ -108,7 +149,17 @@ def rows_match(expected_rows, genie_rows, row_cap=50):
         return False
     if len(expected_rows) > row_cap or len(genie_rows) > row_cap:
         return None
-    return Counter(canon_row(r) for r in expected_rows) == Counter(canon_row(r) for r in genie_rows)
+    E = [tuple(canon_cell(v) for v in (r or [])) for r in expected_rows]
+    G = [tuple(canon_cell(v) for v in (r or [])) for r in genie_rows]
+    if len(E) != len(G):
+        return False
+    if not E:
+        return True
+    if Counter(E) == Counter(G):
+        return True
+    if match_with_permutation(E, G, tolerant=False):
+        return True
+    return match_with_permutation(E, G, tolerant=True)
 
 
 HARD_SQL_TOKENS = (" WITH ", " OVER (", " OVER(", "LAG(", "LEAD(", "RANK(", "DENSE_RANK(", "NTILE(",
@@ -206,8 +257,25 @@ def test_rows_match_multiset_not_set():
 
 
 def test_rows_match_column_order_invariant():
-    # same values, columns reordered/aliased -> still match
+    # same values, columns reordered/aliased -> still match (consistent permutation)
     assert rows_match([[1, 2]], [[2, 1]]) is True
+    assert rows_match([[1, "a"], [2, "b"]], [["a", 1], ["b", 2]]) is True
+
+
+def test_rows_match_inconsistent_swap_fails():
+    # cross-column value swap in ONE row must NOT match (the per-row-sort false-PASS bug):
+    # no single column permutation maps both rows.
+    assert rows_match([[1, 2], [3, 4]], [[2, 1], [3, 4]]) is False
+
+
+def test_rows_match_numeric_tolerance():
+    # ROUND()/float-path differences within 0.1% relative -> match (caught live: 16.67 vs 16.666..)
+    assert rows_match([["16.67"]], [["16.666666666"]]) is True
+    assert rows_match([["33.333333"]], [["33.33"]]) is True
+    # genuinely different values -> no match
+    assert rows_match([["33.33"]], [["34.0"]]) is False
+    # tolerance must not bridge distinct integers
+    assert rows_match([["1000"]], [["1002"]]) is False
 
 
 def test_rows_match_cap_indeterminate():

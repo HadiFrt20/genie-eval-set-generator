@@ -1375,19 +1375,65 @@ def _canon_cell(v) -> str:
     return s
 
 
-def _canon_row(row) -> tuple:
-    """Column-order- and alias-invariant: sort the canonical cell values within the row.
-    Two valid answers that select the same values in a different column order (or with
-    different aliases) still match. Mildly lenient (permutes values within a row) — acceptable
-    for a regression signal, and far safer than position-exact string compare."""
-    return tuple(sorted(_canon_cell(v) for v in (row or [])))
+def _cells_close(a: str, b: str) -> bool:
+    """Numeric-tolerant equality on CANONICAL cells: exact match, or both numeric and within
+    0.1% relative (1e-9 absolute near zero). Absorbs ROUND()/float-path differences between
+    semantically identical SQL (caught live: 16.67 vs 16.666666… scored as a miss)."""
+    if a == b:
+        return True
+    try:
+        da, db = _Decimal(a), _Decimal(b)
+    except Exception:
+        return False
+    diff = abs(da - db)
+    if diff <= _Decimal("1e-9"):
+        return True
+    scale = max(abs(da), abs(db))
+    return (diff / scale) <= _Decimal("0.001")
+
+
+def _match_with_permutation(E, G, tolerant: bool) -> bool:
+    """Match row multisets under ONE consistent column permutation (alias / column-order
+    invariance). Replaces per-row cell-sorting, which let CROSS-COLUMN VALUE SWAPS falsely
+    pass (e.g. [[1,2],[3,4]] vs [[2,1],[3,4]]) — a false PASS inflates the lower bound."""
+    from itertools import permutations as _perms
+    ncols = len(E[0])
+    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
+        return False
+    if ncols > 7:  # 8!+ permutations — fall back to legacy sorted-cell multiset (lenient)
+        return _Counter(tuple(sorted(r)) for r in E) == _Counter(tuple(sorted(r)) for r in G)
+    ce = _Counter(E)
+    for p in _perms(range(ncols)):
+        Gp = [tuple(g[i] for i in p) for g in G]
+        if not tolerant:
+            if ce == _Counter(Gp):
+                return True
+        else:
+            used = [False] * len(Gp)
+            ok = True
+            for e in E:
+                hit = False
+                for j, g in enumerate(Gp):
+                    if not used[j] and all(_cells_close(x, y) for x, y in zip(e, g)):
+                        used[j] = True
+                        hit = True
+                        break
+                if not hit:
+                    ok = False
+                    break
+            if ok:
+                return True
+    return False
 
 
 def rows_match(expected_rows, genie_rows, row_cap: int = 50):
     """Multiset row comparison. Returns True / False / None.
 
-    - multiset (Counter), NOT a set — duplicate rows are preserved, so a wrong-cardinality
-      answer can't pass by silent dedup.
+    - multiset, NOT a set — duplicate rows are preserved, so a wrong-cardinality answer
+      can't pass by silent dedup.
+    - column-order/alias invariant via ONE consistent column permutation across all rows
+      (not per-row cell sorting, which falsely passed cross-column swaps).
+    - numeric-tolerant fallback (_cells_close) absorbs ROUND()/float-path differences.
     - None = NOT-EVALUABLE: excluded from the rate (neither pass nor fail). Two cases:
         (a) no expected baseline (expected_sql failed / permission-denied) — scoring this as a
             Genie miss falsely deflated concordance on perm-gated tables (caught live); and
@@ -1399,7 +1445,17 @@ def rows_match(expected_rows, genie_rows, row_cap: int = 50):
         return False  # we have a baseline but Genie returned nothing → real miss
     if len(expected_rows) > row_cap or len(genie_rows) > row_cap:
         return None
-    return _Counter(_canon_row(r) for r in expected_rows) == _Counter(_canon_row(r) for r in genie_rows)
+    E = [tuple(_canon_cell(v) for v in (r or [])) for r in expected_rows]
+    G = [tuple(_canon_cell(v) for v in (r or [])) for r in genie_rows]
+    if len(E) != len(G):
+        return False
+    if not E:
+        return True   # both empty result sets
+    if _Counter(E) == _Counter(G):
+        return True   # fast path: same column order
+    if _match_with_permutation(E, G, tolerant=False):
+        return True
+    return _match_with_permutation(E, G, tolerant=True)
 
 
 # Run questions in parallel — Genie calls are I/O-bound and one can take 30-60s.
