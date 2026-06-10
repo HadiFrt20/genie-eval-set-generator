@@ -51,7 +51,7 @@ def question_concordance(matrix):
         if vals:
             q_pass.append(sum(vals) / len(vals))
     n_units = len(q_pass)
-    passes = sum(1 for p in q_pass if p >= 0.5)
+    passes = sum(1 for p in q_pass if p > 0.5)  # even split = fail (conservative lower bound)
     return (passes / n_units if n_units else 0.0), n_units
 
 
@@ -64,24 +64,34 @@ from collections import Counter
 from decimal import Decimal
 
 
+import re as _re
+
+_NUM_STR_RE = _re.compile(r"^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$")
+
+
+def dec_fmt(d: Decimal) -> str:
+    if d == 0:
+        d = Decimal(0)                  # normalize -0 / "-0.0" to 0
+    return format(d.normalize(), "f")
+
+
 def canon_cell(v) -> str:
     if v is None:
         return "\x00NULL"
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, Decimal):
-        return format(v.normalize(), "f")
+        return dec_fmt(v)
     if isinstance(v, int):
         return str(v)
     if isinstance(v, float):
-        return format(Decimal(str(v)).normalize(), "f")
+        return dec_fmt(Decimal(str(v)))
     s = str(v).strip()
     core = s.lstrip("+-")
-    if core and core.replace(".", "", 1).isdigit() and not (
-        len(core) > 1 and core[0] == "0" and not core.startswith("0.")
-    ):
+    leading_zero_code = len(core) > 1 and core[0] == "0" and not core.startswith("0.")
+    if _NUM_STR_RE.match(s) and not leading_zero_code:
         try:
-            return format(Decimal(s).normalize(), "f")
+            return dec_fmt(Decimal(s))
         except Exception:
             return s
     return s
@@ -96,7 +106,7 @@ def rows_match(expected_rows, genie_rows, row_cap=50):
         return None
     if genie_rows is None:
         return False
-    if len(expected_rows) >= row_cap or len(genie_rows) >= row_cap:
+    if len(expected_rows) > row_cap or len(genie_rows) > row_cap:
         return None
     return Counter(canon_row(r) for r in expected_rows) == Counter(canon_row(r) for r in genie_rows)
 
@@ -128,7 +138,7 @@ def _approx(a, b, tol=1e-3):
 def test_wilson_half_n14_m3():
     """The headline from the internal review: at N=14*M=3=42 the 7pp gate is unsatisfiable."""
     n = 14 * 3
-    assert _approx(wilson_half(0.5, n), 0.14467, 1e-4), wilson_half(0.5, n)
+    assert _approx(wilson_half(0.5, n), 0.144743, 2e-5), wilson_half(0.5, n)
     floor = min(wilson_half(p / 1000, n) for p in range(100, 901))
     assert _approx(floor, 0.09314, 1e-4), floor
     assert floor > 0.07, "the 7pp gate must be unreachable at N=14/M=3 — that's the whole point"
@@ -157,6 +167,12 @@ def test_rerun_agreement():
     # questions with <2 valid reruns are not judgeable
     agr2, _, judge2 = rerun_agreement([[1, None], [1, 0]])
     assert judge2 == 1 and _approx(agr2, 0.0)
+
+
+def test_question_concordance_tie_is_fail():
+    # M=2 even split (1 pass, 1 fail) -> mean 0.5 -> conservative: NOT a pass
+    conc, n_units = question_concordance([[1, 0]])
+    assert n_units == 1 and conc == 0.0
 
 
 def test_question_concordance_is_n_units_not_cells():
@@ -195,10 +211,13 @@ def test_rows_match_column_order_invariant():
 
 
 def test_rows_match_cap_indeterminate():
-    # a side at the row cap -> None (indeterminate), neither pass nor fail
-    big = [[i] for i in range(50)]
-    assert rows_match(big, big) is None
-    assert rows_match(big, [[0]]) is None
+    # collectors fetch cap+1 rows: len == cap is a COMPLETE result (determinate);
+    # len > cap means truncation -> None (indeterminate)
+    exact = [[i] for i in range(50)]
+    assert rows_match(exact, exact) is True
+    truncated = [[i] for i in range(51)]
+    assert rows_match(truncated, truncated) is None
+    assert rows_match(truncated, [[0]]) is None
 
 
 def test_rows_match_none_semantics():
@@ -206,6 +225,14 @@ def test_rows_match_none_semantics():
     assert rows_match(None, [[1]]) is None
     # we DO have a baseline but Genie returned nothing -> real miss (False)
     assert rows_match([[1]], None) is False
+
+
+def test_canon_cell_scientific_and_negative_zero():
+    # scientific-notation strings unify with their plain forms (warehouse vs Spark fallback)
+    assert canon_cell("1e3") == canon_cell(1000) == "1000"
+    assert canon_cell("1.5E2") == canon_cell(150)
+    # negative zero unifies with zero across all representations
+    assert canon_cell(-0.0) == canon_cell(0) == canon_cell("-0") == canon_cell("0.0")
 
 
 def test_canon_cell_precision_and_codes():

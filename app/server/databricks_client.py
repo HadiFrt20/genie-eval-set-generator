@@ -246,15 +246,17 @@ class DatabricksClient:
         )
         return (d.get("experiment") or {}).get("experiment_id")
 
-    def search_runs(self, experiment_id: str, max_results: int = 12) -> list[dict]:
-        d = self.post(
-            "/api/2.0/mlflow/runs/search",
-            {
-                "experiment_ids": [experiment_id],
-                "max_results": max_results,
-                "order_by": ["attributes.start_time DESC"],
-            },
-        )
+    def search_runs(
+        self, experiment_id: str, max_results: int = 12, filter_string: str = ""
+    ) -> list[dict]:
+        body: dict = {
+            "experiment_ids": [experiment_id],
+            "max_results": max_results,
+            "order_by": ["attributes.start_time DESC"],
+        }
+        if filter_string:
+            body["filter"] = filter_string
+        d = self.post("/api/2.0/mlflow/runs/search", body)
         return d.get("runs") or []
 
     # ------------------------------------------------------------------
@@ -308,6 +310,27 @@ class DatabricksClient:
             d = self.get(f"/api/2.0/sql/statements/{sid}")
         return d
 
+    def sql_rows(self, d: dict) -> list[list]:
+        """All data rows of a finished statement, following result CHUNKS — chunk 0 alone can be
+        a fraction of the result, which silently truncated reads before."""
+        res = d.get("result") or {}
+        rows = list(res.get("data_array") or [])
+        sid = d.get("statement_id")
+        nxt = res.get("next_chunk_index")
+        guard = 0
+        while sid and nxt is not None and guard < 1000:
+            ch = self.get(f"/api/2.0/sql/statements/{sid}/result/chunks/{int(nxt)}")
+            rows.extend(ch.get("data_array") or [])
+            nxt = ch.get("next_chunk_index")
+            guard += 1
+        return rows
+
+    @staticmethod
+    def bt(*parts: str) -> str:
+        """Backtick-quote identifier parts — hyphenated / federated catalog names pass the
+        identifier validator but raise INVALID_IDENTIFIER when interpolated unquoted."""
+        return ".".join(f"`{p.strip('`')}`" for p in parts)
+
     # ------------------------------------------------------------------
     # Runs index — UC metadata table that survives across browsers / sessions.
     # Schema lives at `<catalog>.genie_eval.genie_eval_runs_index`. The DAB declares
@@ -318,13 +341,13 @@ class DatabricksClient:
     RUNS_INDEX_TABLE = "genie_eval_runs_index"
 
     def runs_index_fqn(self, catalog: str) -> str:
-        return f"{catalog}.{self.RUNS_INDEX_SCHEMA}.{self.RUNS_INDEX_TABLE}"
+        return self.bt(catalog, self.RUNS_INDEX_SCHEMA, self.RUNS_INDEX_TABLE)
 
     def ensure_runs_index_table(self, catalog: str, warehouse_id: str) -> dict:
         """Idempotent: create schema + table if missing. Returns the second statement's response."""
         self.sql_run(
             warehouse_id,
-            f"CREATE SCHEMA IF NOT EXISTS {catalog}.{self.RUNS_INDEX_SCHEMA}",
+            f"CREATE SCHEMA IF NOT EXISTS {self.bt(catalog, self.RUNS_INDEX_SCHEMA)}",
         )
         return self.sql_run(
             warehouse_id,
@@ -387,5 +410,5 @@ class DatabricksClient:
         if d.get("status", {}).get("state") != "SUCCEEDED":
             return []
         cols = [c["name"] for c in d.get("manifest", {}).get("schema", {}).get("columns", [])]
-        rows = d.get("result", {}).get("data_array") or []
+        rows = self.sql_rows(d)
         return [dict(zip(cols, row)) for row in rows]

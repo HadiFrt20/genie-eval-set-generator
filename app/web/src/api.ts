@@ -143,6 +143,9 @@ export interface ScorecardResponse {
   life_cycle_state?: string
   result_state?: string
   available_sections?: string[]
+  // 'exact' = MLflow runs tagged with this job run_id; 'latest' = untagged fallback
+  // (newest runs in the experiment — may belong to a different submission).
+  attribution?: string
   scorecard: ScorecardData | null
 }
 

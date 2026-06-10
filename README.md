@@ -89,9 +89,15 @@ databricks bundle deploy --var=output_catalog=<your_catalog>
 After deploy, grant the app's service principal `CAN_USE` on the serving endpoints it uses (the question
 generator and LLM judge always; the embedding endpoint only if you keep the diversity check) and a SQL
 warehouse, plus `USE CATALOG` + `MODIFY` on your catalog (`output_catalog` above is the same catalog the
-notebook calls `uc_catalog`). Then open the app URL `bundle deploy` prints. Prefer no app? Upload
-`genie_eval_set_generator.py` and run it with widget values — see [`examples/`](examples/) for sample
-Jobs-API payloads, and [`app/README.md`](app/README.md) for local dev.
+notebook calls `uc_catalog`). Then start the app and get its URL:
+
+```bash
+databricks bundle run genie_eval_app          # starts the app
+databricks apps list                          # shows the app's URL (or find it under Compute → Apps)
+```
+
+Prefer no app? Upload `genie_eval_set_generator.py` and run it with widget values — see
+[`examples/`](examples/) for sample Jobs-API payloads, and [`app/README.md`](app/README.md) for local dev.
 
 ## Key parameters
 

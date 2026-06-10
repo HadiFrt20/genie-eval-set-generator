@@ -472,7 +472,17 @@ def scorecard(
                 "result_state": result_state,
                 "scorecard": None,
             }
-        runs = c.search_runs(exp_id, max_results=12)
+        # Attribute scorecard runs to THIS job run via the tag the notebook sets. Without the
+        # filter, two runs sharing an experiment would silently show each other's results.
+        runs = c.search_runs(
+            exp_id, max_results=12, filter_string=f"tags.job_run_id = '{run_id}'"
+        )
+        attribution = "exact"
+        if not runs:
+            # Fallback for runs from notebook versions that didn't tag (or interactive runs):
+            # latest runs in the experiment — surfaced as unattributed so the UI can warn.
+            runs = c.search_runs(exp_id, max_results=12)
+            attribution = "latest"
     except AuthError as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -504,6 +514,7 @@ def scorecard(
         "life_cycle_state": life_cycle_state,
         "result_state": result_state,
         "available_sections": sorted(bag.keys()),
+        "attribution": attribution,
         "scorecard": _shape_scorecard(bag),
     }
 
@@ -525,7 +536,7 @@ def eval_set(
         for v in (catalog, schema):
             if not v.replace("_", "").replace("-", "").isalnum():
                 raise HTTPException(status_code=400, detail=f"Invalid identifier: {v}")
-        table = f"{catalog}.{schema}.genie_eval_set"
+        table = DatabricksClient.bt(catalog, schema, "genie_eval_set")
         stmt = (
             "SELECT question, expected_sql, category, difficulty, "
             f"sql_executes, n_result_rows FROM {table} LIMIT {int(limit)}"
@@ -545,7 +556,7 @@ def eval_set(
             "columns": [],
         }
     cols = [c0["name"] for c0 in d.get("manifest", {}).get("schema", {}).get("columns", [])]
-    data = d.get("result", {}).get("data_array") or []
+    data = c.sql_rows(d)[: int(limit)]
     rows = [dict(zip(cols, row)) for row in data]
     return {
         "ok": True,

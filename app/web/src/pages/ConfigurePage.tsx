@@ -423,7 +423,7 @@ export default function ConfigurePage() {
             All optional. See{' '}
             <a
               className="underline"
-              href="https://github.com/HadiFrt20/genie-eval-set-generator#notebook-parameters"
+              href="https://github.com/HadiFrt20/genie-eval-set-generator#key-parameters"
               target="_blank"
               rel="noreferrer"
             >

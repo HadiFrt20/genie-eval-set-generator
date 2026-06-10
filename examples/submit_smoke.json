@@ -5,14 +5,14 @@
     {
       "task_key": "eval",
       "notebook_task": {
-        "notebook_path": "/Users/<you>@databricks.com/genie_eval_set_generator",
+        "notebook_path": "/Users/<your-user-email>/genie_eval_set_generator",
         "source": "WORKSPACE",
         "base_parameters": {
           "uc_catalog": "<your_catalog>",
           "uc_schema": "<your_schema>",
           "genie_space_id": "<32-char hex from data-rooms URL>",
           "genie_tables": "",
-          "mlflow_experiment_path": "/Users/<you>@databricks.com/genie_eval",
+          "mlflow_experiment_path": "/Users/<your-user-email>/genie_eval",
           "generator_endpoint": "databricks-llama-4-maverick",
           "judge_endpoint": "databricks-claude-sonnet-4-5",
           "ai_gateway_base_url": "https://<your-workspace>.cloud.databricks.com/serving-endpoints",

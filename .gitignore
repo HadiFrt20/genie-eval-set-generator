@@ -16,12 +16,3 @@ app/server/static/
 .vscode/
 .idea/
 
-# Internal working docs — kept LOCAL, never published (contain internal review notes / planning).
-.assumptions_verdicts.json
-CODE_REVIEW.md
-METHODOLOGY_REVIEW.md
-ASSUMPTIONS_VALIDATION.md
-goal.md
-todo.md
-docs/BLOG.md
-docs/V0.1.0_PLAN.md

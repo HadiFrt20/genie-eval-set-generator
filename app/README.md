@@ -1,8 +1,8 @@
 # Genie Eval Generator — React + FastAPI app
 
 Frontend on top of the `genie_eval_set_generator` Databricks notebook. It
-detects Genie spaces in the workspace, exposes all notebook widget parameters
-in a real form, submits eval-set generation runs via the Jobs Runs Submit API,
+detects Genie spaces in the workspace, exposes the key notebook widget
+parameters in a real form, submits eval-set generation runs via the Jobs Runs Submit API,
 and renders the scorecard from MLflow + UC tables.
 
 ## Project layout
@@ -103,7 +103,7 @@ databricks apps deploy genie-eval-app \
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/health` | `{ host, authed, notebook_path }` |
+| GET | `/api/health` | `{ host, authed, notebook_path, obo_dev_fallback }` |
 | GET | `/api/me` | OBO-resolved `{ user_name }` (defaults the experiment path) |
 | GET | `/api/spaces` | Genie spaces list |
 | GET | `/api/spaces/{id}` | Full space detail |
@@ -114,6 +114,7 @@ databricks apps deploy genie-eval-app \
 | GET | `/api/runs?limit=25` | Recent workspace runs |
 | GET | `/api/scorecard/{run_id}?experiment_path=...` | Shaped scorecard JSON |
 | GET | `/api/eval-set?catalog=&schema=&limit=200` | Eval-set rows from `genie_eval_set` UC table |
+| GET | `/api/eval-runs-index?catalog=&limit=50` | Submitted-runs index from the UC runs-index table |
 
 ## Tech stack
 

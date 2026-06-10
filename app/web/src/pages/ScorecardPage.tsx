@@ -165,7 +165,22 @@ export default function ScorecardPage() {
           </CardContent>
         </Card>
       ) : (
-        <ScorecardBody data={sc.data.scorecard!} />
+        <>
+          {sc.data.attribution === 'latest' ? (
+            <Card>
+              <CardContent className="flex items-center gap-2 p-3 text-xs text-amber-700">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>
+                  Showing the <span className="font-medium">latest</span> scorecard runs in this
+                  experiment — they could not be attributed to this specific job run (older
+                  notebook version or interactive run). If you submitted multiple runs to the
+                  same experiment, verify in MLflow.
+                </span>
+              </CardContent>
+            </Card>
+          ) : null}
+          <ScorecardBody data={sc.data.scorecard!} />
+        </>
       )}
 
       {sc.data?.ready && params ? (

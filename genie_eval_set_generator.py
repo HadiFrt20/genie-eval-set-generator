@@ -7,7 +7,7 @@
 # MAGIC
 # MAGIC **Scope.** This notebook generates and scores a synthetic eval set, **then runs it against
 # MAGIC Genie** for a row-concordance regression (read it as a lower bound — see Phase 8). It produces
-# MAGIC a curated `(question, expected_sql, expected_rows, quality_scores)` Delta table plus a Genie
+# MAGIC a curated `(question, expected_sql, expected_rows, validity flags)` Delta table plus a Genie
 # MAGIC regression table that downstream systems (Agent Framework evals, benchmark harnesses, CI jobs)
 # MAGIC can consume.
 # MAGIC
@@ -21,15 +21,15 @@
 # MAGIC   SQL-answers-question alignment, grounded-literals, safety)
 # MAGIC - **`mlflow.genai.optimize_prompts`** (GEPA) to refine the generator prompt against these scorers
 # MAGIC
-# MAGIC **Phases**
-# MAGIC 0. Introspect the Genie space + sample low-cardinality column values
-# MAGIC 1. Register the question-generation prompt in UC
-# MAGIC 2. Generate the grounded eval set
-# MAGIC 3. Validate each `expected_sql` (executes? rows returned? capture `expected_rows`)
-# MAGIC 4. Score eval-set quality (clarity, SQL-answers-question, grounded literals, safety)
-# MAGIC 5. Publish curated eval set to UC
-# MAGIC 6. **Run the curated set against Genie** — deterministic result-match + LLM judge on NL answer
-# MAGIC 7. (Optional) Optimize the generator prompt with GEPA against the same scorers
+# MAGIC **Pipeline**
+# MAGIC 1. Introspect the Genie space + sample low-cardinality column values
+# MAGIC 2. Register the question-generation prompt in UC
+# MAGIC 3. Generate the grounded eval set
+# MAGIC 4. Validate each `expected_sql` (executes? rows returned? capture expected rows)
+# MAGIC 5. Score eval-set quality (clarity, SQL-answers-question, grounded literals, safety) + diversity/leakage
+# MAGIC 6. Publish the curated eval set to UC
+# MAGIC 7. **Run the set against Genie** — row-concordance lower bound + reliability across reruns
+# MAGIC 8. (Optional) Optimize the generator prompt with GEPA against the same scorers
 # MAGIC
 # MAGIC LLM-calling functions are wrapped with `@mlflow.trace` so the MLflow UI links each trace
 # MAGIC back to the prompt version that drove it.
@@ -62,7 +62,7 @@ dbutils.widgets.text("questions_per_table", "14", "Questions per table (14 = fas
 dbutils.widgets.text("min_hard_per_table", "5", "Minimum 'hard' questions per table (enforced in the prompt)")
 dbutils.widgets.text("max_distinct_values_per_column", "30", "Low-cardinality column sampling cap (SELECT DISTINCT LIMIT)")
 dbutils.widgets.text("extra_space_instructions", "", "(Optional) extra space instructions to inject — paste Genie space Instructions text here")
-dbutils.widgets.text("embedding_endpoint", "databricks-bge-large-en", "Embedding endpoint for realism scorer (blank = skip realism)")
+dbutils.widgets.text("embedding_endpoint", "databricks-bge-large-en", "Embedding endpoint for the diversity/leakage check (blank = skip it)")
 dbutils.widgets.text("stability_runs", "1", "Genie rerun count M for reliability (1 = skip; ≥2 to compute it, 3+ for a stable number)")
 dbutils.widgets.dropdown("include_historical_in_context", "false", ["false", "true"], "Inject historical_qa into SPACE_CONTEXT (off = test realism without anchor)")
 dbutils.widgets.dropdown("run_prompt_optimization", "false", ["false", "true"], "Run mlflow.genai.optimize_prompts (GEPA, optional)")
@@ -128,6 +128,7 @@ assert GENIE_SPACE_ID, "Set the genie_space_id widget before running"
 # genie_tables can be blank — in that case Phase 0 auto-populates from the space's table_identifiers.
 
 EVAL_SET_TABLE    = f"{CATALOG}.{SCHEMA}.genie_eval_set"
+SYNTH_LOG_TABLE   = f"{CATALOG}.{SCHEMA}.genie_eval_synthetic_log"  # append-only contamination log
 JUDGE_MODEL_URI   = f"databricks:/{JUDGE_ENDPOINT}"
 PROMPT_NAME       = f"{CATALOG}.{SCHEMA}.genie_eval_question_gen"
 
@@ -153,6 +154,28 @@ openai_client = OpenAI(api_key=DATABRICKS_TOKEN, base_url=AI_GATEWAY_BASE_URL)
 # UC Prompt Registry — prompts are first-class UC objects (catalog.schema.name + aliases)
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(MLFLOW_EXPERIMENT)
+
+
+def _job_run_id() -> str:
+    """Root Jobs run-id of this notebook execution ('' when run interactively). Tagged onto every
+    MLflow run so the app can attribute scorecard runs to the EXACT job run being viewed — without
+    it, two runs sharing an experiment would silently show each other's results."""
+    try:
+        ctx = json.loads(dbutils.notebook.entry_point.getDbutils().notebook().getContext().toJson())
+        tags = ctx.get("tags", {}) or {}
+        return str(tags.get("multitaskParentRunId") or tags.get("rootRunId")
+                   or tags.get("jobRunId") or tags.get("runId") or "")
+    except Exception:
+        return ""
+
+
+JOB_RUN_ID = _job_run_id()
+
+
+def _tag_run():
+    """Call inside every mlflow.start_run block."""
+    if JOB_RUN_ID:
+        mlflow.set_tag("job_run_id", JOB_RUN_ID)
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
 
@@ -241,19 +264,24 @@ print(f"  curated questions : {len(curated_questions)}")
 # any historical message that matches a previously-generated synthetic question.
 def _norm_q(s: str) -> str:
     """Normalize a question for contamination matching: lowercase, collapse whitespace, strip
-    trailing punctuation. Catches casing/whitespace/punctuation drift that exact-match misses
-Embedding-based paraphrase exclusion is a further v0.2 step."""
+    trailing punctuation. Catches casing/whitespace/punctuation drift that exact-match misses.
+    Embedding-based paraphrase exclusion is a further roadmap step."""
     return " ".join((s or "").strip().lower().split()).rstrip("?.! ")
 
 
+# Read prior synthetic questions from the APPEND-ONLY log (accumulates across every run and every
+# space) plus the eval-set table (back-compat with runs that predate the log). Reading only the
+# eval-set table was structurally broken: it gets rewritten each run, so the filter only ever knew
+# about the single most recent run.
 prior_synthetic = set()
-try:
-    rows = spark.sql(
-        f"SELECT DISTINCT question FROM {EVAL_SET_TABLE} WHERE genie_space_id = '{GENIE_SPACE_ID}'"
-    ).collect()
-    prior_synthetic = {(r[0] or "").strip() for r in rows if r[0]}
-except Exception:
-    pass  # table doesn't exist on first run; nothing to exclude
+for _src in (SYNTH_LOG_TABLE, EVAL_SET_TABLE):
+    try:
+        rows = spark.sql(
+            f"SELECT DISTINCT question FROM {_src} WHERE genie_space_id = '{GENIE_SPACE_ID}'"
+        ).collect()
+        prior_synthetic |= {(r[0] or "").strip() for r in rows if r[0]}
+    except Exception:
+        pass  # table doesn't exist yet; nothing to exclude from this source
 prior_synthetic_norm = {_norm_q(x) for x in prior_synthetic}
 print(f"  prior synthetic Qs (excluded from history mining): {len(prior_synthetic)}")
 
@@ -535,7 +563,7 @@ if historical_qa and INCLUDE_HISTORICAL:
         + _fmt_historical(historical_qa)
     )
 elif historical_qa:
-    print(f"  (historical_qa kept for realism scorer; NOT injected into SPACE_CONTEXT — include_historical_in_context=false)")
+    print(f"  (historical_qa kept for the diversity/leakage reference; NOT injected into SPACE_CONTEXT — include_historical_in_context=false)")
 if all_fks:
     _sections.append(_fmt_fks(all_fks))
 elif len(GENIE_TABLES) > 1:
@@ -836,6 +864,10 @@ def _selfdedup(items: list[dict], threshold: float = 0.92) -> list[dict]:
         return items
 
 all_questions = _selfdedup(all_questions)
+assert all_questions, (
+    "Generator returned 0 questions. Check the generator endpoint, the gateway base URL, and that "
+    "at least one table survived introspection (see warnings above)."
+)
 
 import uuid as _uuid
 eval_pdf = pd.DataFrame(all_questions)
@@ -856,7 +888,7 @@ display(spark.createDataFrame(eval_pdf))
 
 def execute_expected(sql: str):
     try:
-        rows = [list(r) for r in spark.sql(sql).limit(50).collect()]
+        rows = [list(r) for r in spark.sql(sql).limit(51).collect()]  # cap+1: 51 rows signals truncation
         return rows, None
     except Exception as e:
         return None, str(e)
@@ -989,6 +1021,7 @@ judge_df = pd.DataFrame([
 ])
 
 with mlflow.start_run(run_name="eval_set_quality") as run:
+    _tag_run()
     mlflow.log_param("genie_space_id", GENIE_SPACE_ID)
     mlflow.log_param("n_eval_items", len(validated_pdf))
     mlflow.log_metric("fraction_sql_executes", float(validated_pdf["sql_executes"].mean()))
@@ -1111,17 +1144,19 @@ else:
         print(f"  leakage_risk          : {leakage_risk}  (mean_nn_cosine ≥ 0.97)")
 
         per_q_realism_pdf = pd.DataFrame({
+            "question_id": validated_pdf["question_id"].tolist(),  # join key: unique, unlike text
             "question": generated_questions_for_realism,
             "nearest_reference": [reference_corpus[int(i)] for i in nn_idx],
             "nn_sim": nn_sims.tolist(),
         }).sort_values("nn_sim").reset_index(drop=True)
         validated_pdf = validated_pdf.merge(
-            per_q_realism_pdf[["question", "nn_sim"]].rename(columns={"nn_sim": "diversity_nn_sim"}),
-            on="question", how="left",
+            per_q_realism_pdf[["question_id", "nn_sim"]].rename(columns={"nn_sim": "diversity_nn_sim"}),
+            on="question_id", how="left",
         )
 
         # Run name kept as "eval_set_realism" for back-compat with the app's scorecard lookup.
         with mlflow.start_run(run_name="eval_set_realism"):
+            _tag_run()
             mlflow.log_param("genie_space_id", GENIE_SPACE_ID)
             mlflow.log_param("embedding_endpoint", EMBEDDING_ENDPOINT)
             mlflow.log_param("n_generated", len(generated_questions_for_realism))
@@ -1144,12 +1179,40 @@ else:
 
 # COMMAND ----------
 
+def _write_space_scoped(sdf, table_fqn: str):
+    """Replace only THIS space's rows (other spaces' rows survive). Falls back to a full
+    overwrite — loudly — if replaceWhere can't apply (first write / incompatible old schema)."""
+    if not spark.catalog.tableExists(table_fqn):
+        sdf.write.mode("overwrite").saveAsTable(table_fqn)
+        return
+    try:
+        (sdf.write.mode("overwrite")
+            .option("replaceWhere", f"genie_space_id = '{GENIE_SPACE_ID}'")
+            .option("mergeSchema", "true")
+            .saveAsTable(table_fqn))
+    except Exception as e:
+        print(f"WARNING: scoped write to {table_fqn} failed ({str(e)[:160]}) — falling back to a "
+              f"FULL overwrite. Rows from other Genie spaces in this table were dropped.")
+        sdf.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(table_fqn)
+
+
 final_sdf = (
     spark.createDataFrame(validated_pdf)
     .withColumn("genie_space_id", F.lit(GENIE_SPACE_ID))
 )
-final_sdf.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(EVAL_SET_TABLE)
+_write_space_scoped(final_sdf, EVAL_SET_TABLE)
 print(f"Wrote {final_sdf.count()} validated eval items to {EVAL_SET_TABLE}")
+
+# Append this run's questions to the contamination log so FUTURE runs can exclude them from
+# history mining even after the eval-set table is rewritten (append-only by design).
+try:
+    (final_sdf.select("question_id", "question", "genie_space_id")
+        .withColumn("logged_at", F.current_timestamp())
+        .write.mode("append").option("mergeSchema", "true").saveAsTable(SYNTH_LOG_TABLE))
+    print(f"Appended {final_sdf.count()} questions to the contamination log {SYNTH_LOG_TABLE}")
+except Exception as e:
+    print(f"WARNING: could not append to {SYNTH_LOG_TABLE}: {str(e)[:160]} — future runs will "
+          f"only see THIS run's questions via {EVAL_SET_TABLE}.")
 display(final_sdf)
 
 # COMMAND ----------
@@ -1166,9 +1229,11 @@ display(final_sdf)
 # MAGIC > (1) `expected_sql` is LLM-generated and only
 # MAGIC > checked for executability — never independently verified to answer the question — so a
 # MAGIC > "fail" can mean Genie was right and the generator wrong (inter-model agreement, not truth);
-# MAGIC > (2) `expected_rows` are captured on the notebook's Spark cluster while Genie runs on the
-# MAGIC > space's SQL warehouse, so cross-engine float/decimal/timestamp formatting can fail a correct
-# MAGIC > answer. Same-engine execution + independent ground-truth verification are v0.2 items.
+# MAGIC > (2) expected rows are re-executed on the **space's own SQL warehouse** (the same engine
+# MAGIC > Genie uses) when the runner has `CAN_USE` on it; per-question fallback is the notebook's
+# MAGIC > Spark capture, where cross-engine formatting can still fail a correct answer — the scorecard
+# MAGIC > reports how many questions got the same-engine treatment (`n_same_engine_expected`).
+# MAGIC > Independent ground-truth verification of `expected_sql` remains on the roadmap.
 # MAGIC
 # MAGIC Results land in `{CATALOG}.{SCHEMA}.genie_eval_runs`. Re-run this notebook after any
 # MAGIC Genie space change and diff the MLflow `genie_regression` runs to get a quality delta.
@@ -1182,16 +1247,16 @@ def _collect_statement_rows(statement_id, first_result, row_cap: int = 50):
     """Page through statement-result chunks until we have > row_cap rows, so the cap-indeterminate
     guard in rows_match sees the TRUE result size — chunk 0 can be a small fraction of the result
     (confirmed live: 36 of 70 rows). Returns up to row_cap+1 rows."""
-    rows, res = [], first_result
-    while res is not None:
+    rows, res, guard = [], first_result, 0
+    while res is not None and guard < 1000:
         rows.extend(list(r) for r in (getattr(res, "data_array", None) or []))
         nxt = getattr(res, "next_chunk_index", None)
         if len(rows) > row_cap or nxt is None:
             break
-        try:
-            res = w.statement_execution.get_statement_result_chunk_n(statement_id, nxt)
-        except Exception:
-            break
+        # Let chunk-fetch errors PROPAGATE: a silently truncated read would grade as a
+        # determinate (wrong) result; callers treat the exception as capture failure instead.
+        res = w.statement_execution.get_statement_result_chunk_n(statement_id, nxt)
+        guard += 1
     return rows[: row_cap + 1]
 
 
@@ -1232,7 +1297,15 @@ def run_one_genie(question: str) -> dict:
                 stmt = w.statement_execution.get_statement(sid)
                 rows = _collect_statement_rows(sid, stmt.result, row_cap=50)
             except Exception as e:
-                rows = None
+                # Result-capture failure ≠ Genie answered wrong: surface it as an error so the
+                # question is excluded from the rate rather than scored as a miss.
+                return {
+                    "genie_sql": g_sql or "",
+                    "genie_answer": g_ans or "",
+                    "genie_rows_json": "",
+                    "genie_elapsed_s": round(time.time() - t0, 2),
+                    "genie_error": f"result fetch failed: {str(e)[:300]}",
+                }
         return {
             "genie_sql": g_sql or "",
             "genie_answer": g_ans or "",
@@ -1265,6 +1338,15 @@ def _parse_rows(s: str):
     return rows or []
 
 
+_NUM_STR_RE = re.compile(r"^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _dec_fmt(d: _Decimal) -> str:
+    if d == 0:
+        d = _Decimal(0)                            # normalize -0 / "-0.0" to 0
+    return format(d.normalize(), "f")
+
+
 def _canon_cell(v) -> str:
     """Canonicalize a cell so cross-engine formatting (1 vs 1.0, Decimal, None, bool) doesn't
     cause a false mismatch. The warehouse returns every value as a string in data_array. Uses
@@ -1275,19 +1357,19 @@ def _canon_cell(v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, _Decimal):
-        return format(v.normalize(), "f")
+        return _dec_fmt(v)
     if isinstance(v, int):
         return str(v)                              # exact — no float precision loss
     if isinstance(v, float):
-        return format(_Decimal(str(v)).normalize(), "f")
+        return _dec_fmt(_Decimal(str(v)))
     s = str(v).strip()
     core = s.lstrip("+-")
-    # coerce genuinely-numeric strings, but keep leading-zero codes (e.g. "01234") verbatim
-    if core and core.replace(".", "", 1).isdigit() and not (
-        len(core) > 1 and core[0] == "0" and not core.startswith("0.")
-    ):
+    # coerce genuinely-numeric strings (incl. scientific notation), but keep leading-zero
+    # codes (e.g. "01234" zips/IDs) verbatim
+    leading_zero_code = len(core) > 1 and core[0] == "0" and not core.startswith("0.")
+    if _NUM_STR_RE.match(s) and not leading_zero_code:
         try:
-            return format(_Decimal(s).normalize(), "f")
+            return _dec_fmt(_Decimal(s))
         except Exception:
             return s
     return s
@@ -1309,12 +1391,13 @@ def rows_match(expected_rows, genie_rows, row_cap: int = 50):
     - None = NOT-EVALUABLE: excluded from the rate (neither pass nor fail). Two cases:
         (a) no expected baseline (expected_sql failed / permission-denied) — scoring this as a
             Genie miss falsely deflated concordance on perm-gated tables (caught live); and
-        (b) a side hit the row cap, so truncation can't be trusted to reflect full equality."""
+        (b) a side exceeded the row cap (collectors fetch cap+1 rows, so len > cap means the
+            result was truncated; len == cap is a complete result and stays determinate)."""
     if expected_rows is None:
         return None   # no baseline captured → not-evaluable, NOT a Genie miss
     if genie_rows is None:
         return False  # we have a baseline but Genie returned nothing → real miss
-    if len(expected_rows) >= row_cap or len(genie_rows) >= row_cap:
+    if len(expected_rows) > row_cap or len(genie_rows) > row_cap:
         return None
     return _Counter(_canon_row(r) for r in expected_rows) == _Counter(_canon_row(r) for r in genie_rows)
 
@@ -1386,7 +1469,13 @@ print(f"Expected rows: {n_same_engine}/{N_questions} executed on the space wareh
 
 # Row concordance: multiset, engine-consistent, cap-aware (True / False / None=indeterminate).
 genie_rows_parsed = [_parse_rows(s) for s in runs_pdf["genie_rows_json"].tolist()]
-match_results = [rows_match(expected_rows_engine[i], genie_rows_parsed[i]) for i in range(len(runs_pdf))]
+_g_err = runs_pdf["genie_error"].tolist()
+# Genie API / capture errors are NOT-EVALUABLE (excluded from the rate, surfaced via
+# n_genie_errors) — the same treatment the reliability phase gives them.
+match_results = [
+    None if _g_err[i] else rows_match(expected_rows_engine[i], genie_rows_parsed[i])
+    for i in range(len(runs_pdf))
+]
 runs_pdf["result_match"] = [m is True for m in match_results]
 runs_pdf["match_indeterminate"] = [m is None for m in match_results]
 runs_pdf["expected_engine"] = expected_engine_kind
@@ -1426,6 +1515,7 @@ judge_df = pd.DataFrame([
 ])
 
 with mlflow.start_run(run_name="genie_regression"):
+    _tag_run()
     mlflow.log_param("genie_space_id", GENIE_SPACE_ID)
     mlflow.log_param("eval_set_table", EVAL_SET_TABLE)
     # Document what the headline number is and is NOT.
@@ -1504,7 +1594,7 @@ def _wilson_half(p: float, n: int, zc: float = 1.96) -> float:
 def _n_for_half(p: float, target: float, n_floor: int = 2, zc: float = 1.96) -> int:
     """Smallest n whose Wilson half-width ≤ target at proportion p (search, capped)."""
     n = max(n_floor, 2)
-    while _wilson_half(p, n) > target and n < 100000:
+    while _wilson_half(p, n, zc) > target and n < 100000:
         n += 1
     return n
 
@@ -1542,7 +1632,7 @@ if STABILITY_RUNS >= 2:
     # --- Question-level concordance + Wilson CI on N INDEPENDENT units ---
     # Unit = question (NOT N×M correlated cells). A question "passes" if its mean rerun pass ≥ 0.5.
     n_units = len(q_pass)
-    passes = sum(1 for p in q_pass if p >= 0.5)
+    passes = sum(1 for p in q_pass if p > 0.5)  # even split = fail (conservative lower bound)
     pooled_p = (passes / n_units) if n_units else 0.0
 
     z = 1.96
@@ -1572,6 +1662,7 @@ if STABILITY_RUNS >= 2:
     print(f"  Gateable             : {gateable}  (need agreement≥0.90 AND half-width≤{GATE_MAX_HALF_WIDTH_PP:.1f}pp AND {MIN_POOLED_PASS_OVERRIDE}≤concordance≤{MAX_POOLED_PASS_OVERRIDE})")
 
     with mlflow.start_run(run_name="eval_set_stability"):
+        _tag_run()
         mlflow.log_param("genie_space_id", GENIE_SPACE_ID)
         mlflow.log_param("M_reruns", STABILITY_RUNS)
         mlflow.log_param("N_questions", N_questions)
@@ -1598,7 +1689,7 @@ else:
 
 # Persist the regression run
 runs_sdf = spark.createDataFrame(runs_pdf)
-runs_sdf.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(EVAL_RUNS_TABLE)
+_write_space_scoped(runs_sdf, EVAL_RUNS_TABLE)  # rows carry genie_space_id from the eval table
 print(f"Wrote {runs_sdf.count()} Genie regression rows to {EVAL_RUNS_TABLE}")
 display(runs_sdf)
 
