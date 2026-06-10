@@ -683,6 +683,13 @@ Rules:
      names, time framing, segmentation dimensions) as those curated examples. A question that uses generic
      analyst language ("count of records", "average value") instead of the operator's domain language
      ("attainment by program", "policyholder retention by region") is a FAILURE. Match the style, explore new shapes.
+  9. Name the RESULT GRAIN explicitly: "how many readings" vs "how many pumps" are different questions —
+     the question must say which. An analyst reading ONLY the question must know whether rows or distinct
+     entities are being counted/averaged.
+  10. State exactly which quantities the answer should return (and only those) — a question whose expected
+      SQL returns columns the question never asked for is a FAILURE.
+  11. Use LITERAL date anchors ("in March 2024"), never NOW()/CURRENT_DATE or relative windows
+      ("last 30 days") — relative dates make the expected answer unstable over time.
 
 Return ONLY a JSON object with a single key `questions` whose value is an array of objects with EXACTLY these fields: question, expected_sql, expected_shape, category, difficulty, why_non_trivial.
 Do NOT include markdown fences or commentary.
