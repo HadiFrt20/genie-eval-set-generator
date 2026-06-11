@@ -389,6 +389,20 @@ def sample_low_card_columns(fqn: str, cap: int, n_rows=None) -> str:
         if 0 < len(distinct) <= cap:
             vals = sorted({str(r["v"]) for r in distinct})
             lines.append(f"  - {c}: {vals}")
+    # Date/timestamp columns are never low-cardinality, so without this the generator has NO
+    # literal dates to anchor time windows to — pushing it toward CURRENT_DATE/"this month",
+    # which makes pairs unverifiable and unstable (caught live).
+    for r0 in cols:
+        nm, ty = r0["col_name"], (r0["data_type"] or "").lower()
+        if nm and not str(nm).startswith("#") and ("date" in ty or "timestamp" in ty):
+            try:
+                mm = spark.sql(
+                    f"SELECT CAST(MIN(`{nm}`) AS STRING) a, CAST(MAX(`{nm}`) AS STRING) b FROM {_bt(fqn)}"
+                ).collect()
+                if mm and mm[0]["a"]:
+                    lines.append(f"  - {nm}: date range {mm[0]['a']} .. {mm[0]['b']}")
+            except Exception:
+                pass
     return "\n".join(lines) if lines else "  (no low-cardinality columns)"
 
 
@@ -441,6 +455,11 @@ for t in GENIE_TABLES:
         continue
     schema = "\n".join(meta["schema_lines"])
     rc = row_count(t)
+    if rc < 0:
+        # DESCRIBE succeeded but reading failed — metadata-only access (e.g. BROWSE). Keeping the
+        # table would generate questions whose every expected_sql fails (caught live).
+        print(f"  ERROR: table is metadata-readable but not query-readable (no SELECT?) — pruned")
+        continue
     col_samples = sample_low_card_columns(t, MAX_DISTINCT, rc)
     fks = foreign_keys_for_table(t)
     for fk in fks:
@@ -546,7 +565,10 @@ if curated_questions and len(GENIE_TABLES) > 1:
         "vocabulary, and business framing this space's users actually employ). EMULATE this "
         "style: same business terminology (metric names, time framing, entity types, segmentation "
         "dimensions). Do NOT copy verbatim — generate NEW questions in the SAME STYLE that explore "
-        "DIFFERENT filter combinations, time windows, or aggregation shapes.\n"
+        "DIFFERENT filter combinations, time windows, or aggregation shapes. ONE EXCEPTION: the "
+        "numbered Rules below OVERRIDE these examples — if an example says 'this month' or "
+        "'recently', your question must still use LITERAL date ranges (see the date ranges in the "
+        "column samples); relative-time questions are rejected.\n"
         + _fmt_curated(curated_questions)
     )
 elif curated_questions:
@@ -880,11 +902,20 @@ def _selfdedup(items: list[dict], threshold: float = 0.92) -> list[dict]:
 
 # Normalize generator items BEFORE anything consumes them: one item missing a key would
 # otherwise become NaN in pandas and crash createDataFrame / structural_difficulty (cold review).
-_norm_items, _dropped_items = [], 0
+_norm_items, _dropped_items, _dropped_relative = [], 0, 0
+import re as _re_norm  # local: the notebook-wide `import re` lives in a later cell
+_REL_Q = _re_norm.compile(r"(?i)\bthis (month|week|year|quarter)\b|\blast \d+ (day|week|month)s?\b|\bnext \d+")
+_REL_SQL = _re_norm.compile(r"(?i)current_date|current_timestamp|\bnow\s*\(|\bgetdate\s*\(")
 for _q in all_questions:
     if not isinstance(_q, dict) or not str(_q.get("question") or "").strip() \
             or not str(_q.get("expected_sql") or "").strip():
         _dropped_items += 1
+        continue
+    if _REL_Q.search(str(_q.get("question"))) or _REL_SQL.search(str(_q.get("expected_sql"))):
+        # Relative time windows make the pair unverifiable and unstable: the expected answer
+        # changes with the clock/data. Rule 11 bans them; curated few-shot kept re-introducing
+        # them anyway (measured twice live), so enforce deterministically.
+        _dropped_relative += 1
         continue
     _norm_items.append({
         "question": str(_q["question"]).strip(),
@@ -898,6 +929,8 @@ for _q in all_questions:
     })
 if _dropped_items:
     print(f"WARNING: dropped {_dropped_items} malformed generator item(s) (missing question/expected_sql)")
+if _dropped_relative:
+    print(f"WARNING: dropped {_dropped_relative} relative-time item(s) ('this month'/CURRENT_DATE — unverifiable)")
 all_questions = _norm_items
 
 all_questions = _selfdedup(all_questions)
@@ -963,6 +996,14 @@ for _, r in eval_pdf.iterrows():
     rows, err = execute_expected(r["expected_sql"])
     n_rows = len(rows) if rows is not None else 0
     struct_diff = structural_difficulty(r["expected_sql"])
+    # Determinism check: execute twice and compare as order-insensitive multisets. A query whose
+    # own re-execution differs (LIMIT without ORDER BY, sampling, drifting data) can never be
+    # graded meaningfully — flag it so downstream excludes it (caught live on live tables).
+    sql_deterministic = True
+    if rows:
+        rows2, _err2 = execute_expected(r["expected_sql"])
+        if rows2 is None or sorted(map(repr, rows)) != sorted(map(repr, rows2)):
+            sql_deterministic = False
     validated.append({
         **r.to_dict(),
         "expected_rows_json": json.dumps(rows, default=str) if rows is not None else "",
@@ -970,6 +1011,7 @@ for _, r in eval_pdf.iterrows():
         "sql_error": err or "",
         "sql_executes": err is None,
         "nonempty_result": n_rows > 0,
+        "sql_deterministic": sql_deterministic,
         "difficulty_structural": struct_diff,
         "difficulty_label_matches": (str(r.get("difficulty", "")).lower() == struct_diff),
     })
@@ -1538,6 +1580,11 @@ from concurrent.futures import ThreadPoolExecutor
 # An unfiltered read ran foreign spaces' questions against this Genie AND poisoned the
 # scoped write downstream (cold-review board, critical).
 eval_pub_pdf = spark.table(EVAL_SET_TABLE).where(F.col("genie_space_id") == GENIE_SPACE_ID).toPandas()
+if "sql_deterministic" in eval_pub_pdf.columns:
+    _n_nondet = int((eval_pub_pdf["sql_deterministic"] == False).sum())  # noqa: E712
+    if _n_nondet:
+        print(f"Excluding {_n_nondet} non-deterministic item(s) from the regression (ungradeable).")
+        eval_pub_pdf = eval_pub_pdf[eval_pub_pdf["sql_deterministic"] != False]  # noqa: E712
 N_questions = len(eval_pub_pdf)
 print(f"Running {N_questions} eval questions × {STABILITY_RUNS} rerun(s) against Genie space {GENIE_SPACE_ID}...")
 
