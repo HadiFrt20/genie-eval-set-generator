@@ -387,6 +387,7 @@ def _shape_scorecard(bag: dict[str, dict]) -> dict:
     stability_metrics = bag.get("eval_set_stability", {}).get("metrics", {})
     stability_params = bag.get("eval_set_stability", {}).get("params", {})
     quality_metrics = bag.get("eval_set_quality", {}).get("metrics", {})
+    verification_metrics = bag.get("eval_set_verification", {}).get("metrics", {})
     regression_metrics = bag.get("genie_regression", {}).get("metrics", {})
     regression_params = bag.get("genie_regression", {}).get("params", {})
 
@@ -431,6 +432,17 @@ def _shape_scorecard(bag: dict[str, dict]) -> dict:
             "n_units": stability_metrics.get("n_units"),
             "n_needed_for_target": stability_metrics.get("n_needed_for_target"),
             "gate_max_half_width_pp": stability_metrics.get("gate_max_half_width_pp"),
+        },
+        # Trust gate: execution-verified by two model families — certificates, never "accuracy".
+        "verification": {
+            "computed": "eval_set_verification" in bag,
+            "verified_fraction": verification_metrics.get("verified_fraction"),
+            "gold_count": verification_metrics.get("gold_count"),
+            "verified_count": verification_metrics.get("verified_count"),
+            "quarantine_count": verification_metrics.get("quarantine_count"),
+            "repaired_count": verification_metrics.get("repaired_count"),
+            "mean_panel_agreement": verification_metrics.get("mean_panel_agreement"),
+            "n_gated": verification_metrics.get("n_gated"),
         },
         "quality": {
             "sql_executes": quality_metrics.get("fraction_sql_executes"),
@@ -490,7 +502,7 @@ def scorecard(
         raise HTTPException(status_code=401, detail=str(e))
 
     bag: dict[str, dict] = {}
-    expected = {"eval_set_realism", "eval_set_stability", "genie_regression", "eval_set_quality"}
+    expected = {"eval_set_realism", "eval_set_stability", "genie_regression", "eval_set_quality", "eval_set_verification"}
     for r in runs:
         rn = r.get("info", {}).get("run_name", "")
         if rn in expected and rn not in bag:

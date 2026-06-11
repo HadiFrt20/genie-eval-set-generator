@@ -36,7 +36,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install --quiet "mlflow[databricks]>=3.5.0" "openai>=1.50.0" "databricks-sdk>=0.40.0" "gepa>=0.0.26"
+# MAGIC %pip install --quiet "mlflow[databricks]>=3.5.0" "openai>=1.50.0" "databricks-sdk>=0.40.0" "gepa>=0.0.26" "sqlglot>=25.0.0"
 
 # COMMAND ----------
 
@@ -64,6 +64,7 @@ dbutils.widgets.text("max_distinct_values_per_column", "30", "Low-cardinality co
 dbutils.widgets.text("extra_space_instructions", "", "(Optional) extra space instructions to inject — paste Genie space Instructions text here")
 dbutils.widgets.text("embedding_endpoint", "databricks-bge-large-en", "Embedding endpoint for the diversity/leakage check (blank = skip it)")
 dbutils.widgets.text("stability_runs", "1", "Genie rerun count M for reliability (1 = skip; ≥2 to compute it, 3+ for a stable number)")
+dbutils.widgets.text("verification_k", "5", "Trust-gate panel size k (0 = skip; 5 = 3 generator-family + 2 judge-family solvers)")
 dbutils.widgets.dropdown("include_historical_in_context", "false", ["false", "true"], "Inject historical_qa into SPACE_CONTEXT (off = test realism without anchor)")
 dbutils.widgets.dropdown("run_prompt_optimization", "false", ["false", "true"], "Run mlflow.genai.optimize_prompts (GEPA, optional)")
 
@@ -110,6 +111,7 @@ assert MIN_HARD_PER_TABLE <= QUESTIONS_PER_TABLE, "min_hard_per_table cannot exc
 EXTRA_INSTRUCTIONS  = dbutils.widgets.get("extra_space_instructions").strip()
 EMBEDDING_ENDPOINT  = dbutils.widgets.get("embedding_endpoint").strip()
 STABILITY_RUNS      = int(dbutils.widgets.get("stability_runs") or "1")
+VERIFICATION_K      = int(dbutils.widgets.get("verification_k") or "5")
 INCLUDE_HISTORICAL  = dbutils.widgets.get("include_historical_in_context") == "true"
 assert STABILITY_RUNS >= 1, "stability_runs must be >= 1"
 RUN_OPTIMIZATION    = dbutils.widgets.get("run_prompt_optimization") == "true"
@@ -599,6 +601,20 @@ if EXTRA_INSTRUCTIONS:
 
 SPACE_CONTEXT = "\n\n".join(_sections)
 
+# Context parity for the trust gate (Phase 5.5): the verifier panel must see the same DECLARED
+# semantics Genie has — instructions + curated questions — not just schema+samples. Verified live:
+# a schema-only solver can't fairly referee an instruction-bearing space.
+_solver_sections = []
+for _t in GENIE_TABLES:
+    _c = table_contexts[_t]
+    _solver_sections.append(f"TABLE {_t}\n{_c['schema']}\nsample values (use these literals):\n{_c['col_samples']}")
+if space_instructions:
+    _solver_sections.append(f"SPACE INSTRUCTIONS (declared semantics — follow them):\n{space_instructions}")
+if curated_questions:
+    _solver_sections.append("OPERATOR-CURATED EXAMPLE QUESTIONS (vocabulary + semantics reference):\n"
+                            + _fmt_curated(curated_questions))
+SOLVER_CONTEXT = "\n\n".join(_solver_sections)
+
 # If the grounding context is essentially empty, tell the operator WHY — distinguish a
 # genuinely sparse space from a broken extraction (permission/URL). _get_json already logged any
 # HTTP errors above; this is the summary banner so a low-quality run isn't misread as "weak generator".
@@ -933,6 +949,73 @@ if _dropped_relative:
     print(f"WARNING: dropped {_dropped_relative} relative-time item(s) ('this month'/CURRENT_DATE — unverifiable)")
 all_questions = _norm_items
 
+# --- P0 deterministic guards: typed lint + SQL-skeleton dedup (literals masked) ---
+COLUMN_COVERAGE = None
+try:
+    import sqlglot as _sg
+    from sqlglot import exp as _sgexp
+    _SG_OK = True
+except Exception as _e:
+    _SG_OK = False
+    print(f"WARNING: sqlglot unavailable ({_e}) — typed lint + skeleton dedup skipped")
+
+if _SG_OK and all_questions:
+    _types = {}
+    for _tname, _tctx in table_contexts.items():
+        for _line in (_tctx.get("schema") or "").splitlines():
+            _m = _re_norm.match(r"\s*-\s*([A-Za-z0-9_]+):\s*([a-zA-Z0-9_<>,() ]+)", _line)
+            if _m:
+                _types.setdefault(_m.group(1).lower(), _m.group(2).strip().lower())
+    _NUMAGGS = {"SUM", "AVG", "STDDEV", "VARIANCE", "STDDEV_POP", "STDDEV_SAMP", "VAR_POP", "VAR_SAMP"}
+
+    def _lint_sql(sql):
+        """Reject the illogical-SQL class shown to make synthetic data net-harmful:
+        unparseable statements and numeric aggregates over string/boolean columns."""
+        try:
+            _tree = _sg.parse_one(sql, read="spark")
+        except Exception as _pe:
+            return f"unparseable: {str(_pe)[:80]}", None
+        for _fn in _tree.find_all(_sgexp.Func):
+            _nm = (_fn.sql_name() or "").upper()
+            if _nm in _NUMAGGS:
+                for _col in _fn.find_all(_sgexp.Column):
+                    _ty = _types.get(_col.name.lower(), "")
+                    if "string" in _ty or "boolean" in _ty:
+                        return f"{_nm} over non-numeric column {_col.name} ({_ty})", _tree
+        return None, _tree
+
+    def _sql_skeleton(tree):
+        """Literals-masked skeleton: structural-duplicate key (identifiers KEPT — masking them
+        would collapse distinct single-table questions)."""
+        def _mask(node):
+            if isinstance(node, _sgexp.Literal):
+                return _sgexp.Literal.string("?") if node.is_string else _sgexp.Literal.number(0)
+            return node
+        return tree.copy().transform(_mask).sql(dialect="spark", normalize=True)
+
+    _kept, _lint_drops, _skel_seen, _skel_drops, _used_cols = [], 0, set(), 0, set()
+    for _q in all_questions:
+        _reason, _tree = _lint_sql(_q["expected_sql"])
+        if _reason:
+            _lint_drops += 1
+            continue
+        _sk = _sql_skeleton(_tree)
+        if _sk in _skel_seen:
+            _skel_drops += 1
+            continue
+        _skel_seen.add(_sk)
+        for _col in _tree.find_all(_sgexp.Column):
+            _used_cols.add(_col.name.lower())
+        _kept.append(_q)
+    if _lint_drops or _skel_drops:
+        print(f"P0 guards: dropped {_lint_drops} lint failure(s), {_skel_drops} structural duplicate(s)")
+    all_questions = _kept
+    if _types:
+        COLUMN_COVERAGE = round(len(_used_cols & set(_types)) / len(_types), 3)
+        _unused = sorted(set(_types) - _used_cols)
+        print(f"Column coverage: {COLUMN_COVERAGE:.0%} of {len(_types)} known columns"
+              + (f" — unused: {_unused[:12]}{'…' if len(_unused) > 12 else ''}" if _unused else ""))
+
 all_questions = _selfdedup(all_questions)
 assert all_questions, (
     "Generator returned 0 questions. Check the generator endpoint, the gateway base URL, and that "
@@ -1019,6 +1102,336 @@ for _, r in eval_pdf.iterrows():
 validated_pdf = pd.DataFrame(validated)
 print(f"SQL executes:      {validated_pdf['sql_executes'].sum()} / {len(validated_pdf)}")
 print(f"Nonempty results:  {validated_pdf['nonempty_result'].sum()} / {len(validated_pdf)}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 5.5 Trust gate — execution-verified answer keys (cross-family panel)
+# MAGIC
+# MAGIC Computed when `verification_k ≥ 2`. For each validated pair, **k independent solvers** —
+# MAGIC interleaved across two model families (generator + judge) at varied temperatures — receive
+# MAGIC ONLY the question plus the space's **declared semantics** (instructions + curated questions:
+# MAGIC context parity with Genie) and write SQL blind. Executed results are compared to the
+# MAGIC expected rows.
+# MAGIC
+# MAGIC Tiers — labelled *execution-verified by two model families*, deliberately **never "accuracy"**:
+# MAGIC - **GOLD** — every valid panel vote matched, with ≥1 match from each family
+# MAGIC - **VERIFIED** — strict majority matched, with ≥1 match from each family
+# MAGIC - **QUARANTINE** — everything else: kept and published with its tier, **excluded from the
+# MAGIC   Genie regression**, and first in the human-review queue (a quarantined pair usually means a
+# MAGIC   wrong answer key or an ambiguous question — one question-rewrite repair is attempted first)
+# MAGIC
+# MAGIC Free byproduct: **empirical difficulty** = 1 − panel pass rate (easy ≥0.8 / medium / hard <0.4 /
+# MAGIC suspect = zero matches).
+
+# COMMAND ----------
+
+import re
+
+from collections import Counter as _Counter
+from decimal import Decimal as _Decimal
+
+
+def _parse_rows(s: str):
+    """Parse a stored rows-JSON string to a list of row-lists, or None if blank/invalid."""
+    if not s:
+        return None
+    try:
+        rows = json.loads(s)
+    except Exception:
+        return None
+    return rows or []
+
+
+_NUM_STR_RE = re.compile(r"^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$")
+
+
+def _dec_fmt(d: _Decimal) -> str:
+    if d == 0:
+        d = _Decimal(0)                            # normalize -0 / "-0.0" to 0
+    return format(d.normalize(), "f")
+
+
+def _canon_cell(v) -> str:
+    """Canonicalize a cell so cross-engine formatting (1 vs 1.0, Decimal, None, bool) doesn't
+    cause a false mismatch. The warehouse returns every value as a string in data_array. Uses
+    Decimal (not float) so big integers keep full precision, and preserves codes with leading
+    zeros (zips/phones/IDs) instead of coercing them to numbers (caught live)."""
+    if v is None:
+        return "\x00NULL"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, _Decimal):
+        return _dec_fmt(v)
+    if isinstance(v, int):
+        return str(v)                              # exact — no float precision loss
+    if isinstance(v, float):
+        return _dec_fmt(_Decimal(str(v)))
+    s = str(v).strip()
+    core = s.lstrip("+-")
+    # coerce genuinely-numeric strings (incl. scientific notation), but keep leading-zero
+    # codes (e.g. "01234" zips/IDs) verbatim
+    leading_zero_code = len(core) > 1 and core[0] == "0" and not core.startswith("0.")
+    if _NUM_STR_RE.match(s) and not leading_zero_code:
+        try:
+            return _dec_fmt(_Decimal(s))
+        except Exception:
+            return s
+    return s
+
+
+def _cells_close(a: str, b: str) -> bool:
+    """Numeric-tolerant equality on CANONICAL cells: exact match, or both numeric and within
+    0.1% relative (1e-9 absolute near zero). Absorbs ROUND()/float-path differences between
+    semantically identical SQL (caught live: 16.67 vs 16.666666… scored as a miss)."""
+    if a == b:
+        return True
+    # Tolerance is for ROUND()/float-path differences — it only applies when a side has a
+    # fractional part. Integer-valued cells (counts, IDs) must match EXACTLY: the old behavior
+    # bridged 999 vs 1000 at any scale >= 999 (cold-review board).
+    if "." not in a and "." not in b:
+        return False
+    try:
+        da, db = _Decimal(a), _Decimal(b)
+    except Exception:
+        return False
+    diff = abs(da - db)
+    if diff <= _Decimal("1e-9"):
+        return True
+    scale = max(abs(da), abs(db))
+    return (diff / scale) <= _Decimal("0.001")
+
+
+def _match_with_permutation(E, G, tolerant: bool) -> bool:
+    """Match row multisets under ONE consistent column permutation (alias / column-order
+    invariance). Replaces per-row cell-sorting, which let CROSS-COLUMN VALUE SWAPS falsely
+    pass (e.g. [[1,2],[3,4]] vs [[2,1],[3,4]]) — a false PASS inflates the lower bound."""
+    from itertools import permutations as _perms
+    ncols = len(E[0])
+    ce = _Counter(E)
+    for p in _perms(range(ncols)):
+        Gp = [tuple(g[i] for i in p) for g in G]
+        if not tolerant:
+            if ce == _Counter(Gp):
+                return True
+        else:
+            used = [False] * len(Gp)
+            ok = True
+            for e in E:
+                hit = False
+                for j, g in enumerate(Gp):
+                    if not used[j] and all(_cells_close(x, y) for x, y in zip(e, g)):
+                        used[j] = True
+                        hit = True
+                        break
+                if not hit:
+                    ok = False
+                    break
+            if ok:
+                return True
+    return False
+
+
+def rows_match(expected_rows, genie_rows, row_cap: int = 50):
+    """Multiset row comparison. Returns True / False / None.
+
+    - multiset, NOT a set — duplicate rows are preserved, so a wrong-cardinality answer
+      can't pass by silent dedup.
+    - column-order/alias invariant via ONE consistent column permutation across all rows
+      (not per-row cell sorting, which falsely passed cross-column swaps).
+    - numeric-tolerant fallback (_cells_close) absorbs ROUND()/float-path differences.
+    - None = NOT-EVALUABLE: excluded from the rate (neither pass nor fail). Two cases:
+        (a) no expected baseline (expected_sql failed / permission-denied) — scoring this as a
+            Genie miss falsely deflated concordance on perm-gated tables (caught live); and
+        (b) a side exceeded the row cap (collectors fetch cap+1 rows, so len > cap means the
+            result was truncated; len == cap is a complete result and stays determinate)."""
+    if expected_rows is None:
+        return None   # no baseline captured → not-evaluable, NOT a Genie miss
+    if genie_rows is None:
+        return False  # we have a baseline but Genie returned nothing → real miss
+    if len(expected_rows) > row_cap or len(genie_rows) > row_cap:
+        return None
+    E = [tuple(_canon_cell(v) for v in (r or [])) for r in expected_rows]
+    G = [tuple(_canon_cell(v) for v in (r or [])) for r in genie_rows]
+    if len(E) != len(G):
+        return False
+    if not E:
+        # Both empty: uninformative — two unrelated wrong queries that each return nothing must
+        # not count as agreement (cold-review board). Excluded from the rate.
+        return None
+    if _Counter(E) == _Counter(G):
+        return True   # fast path: same column order (safe at any width)
+    ncols = len(E[0])
+    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
+        return False
+    if ncols > 7:
+        # Permutation search is infeasible past 7 columns and the old sorted-cell fallback
+        # admitted false PASSes (inconsistent cross-column swaps). Wide results that don't
+        # match in-order are NOT-EVALUABLE rather than leniently matched.
+        return None
+    if _match_with_permutation(E, G, tolerant=False):
+        return True
+    return _match_with_permutation(E, G, tolerant=True)
+
+
+def _extract_sql_text(raw: str) -> str:
+    """Hardened solver-output extraction: strip fences, take from the first WITH/SELECT, drop
+    trailing prose, first statement only (solver models occasionally append commentary)."""
+    s = re.sub(r"```(sql)?", "", raw or "").strip()
+    m = re.search(r"(?is)\b(WITH|SELECT)\b.*", s)
+    if not m:
+        return s
+    return re.split(r"\n\s*\n(?=[A-Z][a-z])", m.group(0))[0].split(";")[0].strip()
+
+
+def verify_tier(votes):
+    """votes: list of (family, verdict) with verdict in {True, False, None=not-evaluable}.
+    Returns (tier, n_match, n_votes). Both GOLD and VERIFIED require at least one matching
+    derivation from EACH family — that is the 'two model families' certificate."""
+    valid = [(f, v) for f, v in votes if v is not None]
+    n_votes = len(valid)
+    n_match = sum(1 for _, v in valid if v)
+    if n_votes == 0:
+        return "not_evaluable", 0, 0
+    fams_matched = {f for f, v in valid if v}
+    if n_match == n_votes and len(fams_matched) >= 2:
+        return "gold", n_match, n_votes
+    if n_match * 2 > n_votes and len(fams_matched) >= 2:
+        return "verified", n_match, n_votes
+    return "quarantine", n_match, n_votes
+
+
+def empirical_difficulty(n_match: int, n_votes: int) -> str:
+    """1 − panel pass rate, binned. 'suspect' (zero matches) = concentrated wrong-key candidates."""
+    if n_votes == 0:
+        return "unknown"
+    rate = n_match / n_votes
+    if n_match == 0:
+        return "suspect"
+    if rate >= 0.8:
+        return "easy"
+    if rate >= 0.4:
+        return "medium"
+    return "hard"
+
+
+if VERIFICATION_K >= 2 and len(validated_pdf):
+    from concurrent.futures import ThreadPoolExecutor as _TPE
+
+    # Interleave families so any k ≥ 2 includes both.
+    _PANEL = [("gen", GENERATOR_ENDPOINT, 0.0), ("judge", JUDGE_ENDPOINT, 0.0),
+              ("gen", GENERATOR_ENDPOINT, 0.4), ("judge", JUDGE_ENDPOINT, 0.5),
+              ("gen", GENERATOR_ENDPOINT, 0.8)][:VERIFICATION_K]
+
+    def _solve_one(question, endpoint, temp):
+        """One blind derivation under context parity. Returns rows or None (not-evaluable)."""
+        _prompt = (SOLVER_CONTEXT
+                   + "\n\nWrite ONE Databricks SQL query answering exactly this question. Project "
+                     "EXACTLY the quantities the question asks for - no extra columns. Use only "
+                     "literal values present in the samples/instructions. Return ONLY the SQL - "
+                     "no commentary, no markdown.\nQuestion: " + question)
+        try:
+            _resp = openai_client.chat.completions.create(
+                model=endpoint, messages=[{"role": "user", "content": _prompt}],
+                max_tokens=1500, temperature=temp)
+            _sql = _extract_sql_text(_resp.choices[0].message.content or "")
+            if not _is_readonly_sql(_sql):
+                return None
+            _rows, _err = execute_expected(_sql)
+            return _rows
+        except Exception:
+            return None
+
+    def _panel_votes(question, expected_rows, panel):
+        with _TPE(max_workers=4) as _ex:
+            _solved = list(_ex.map(lambda p: (p[0], _solve_one(question, p[1], p[2])), panel))
+        _votes = []
+        for _fam, _rows in _solved:
+            if _rows is None:
+                _votes.append((_fam, None))
+            else:
+                _m = rows_match(expected_rows, _rows)
+                _votes.append((_fam, _m if _m is None else bool(_m)))
+        return _votes
+
+    def _repair_question(question, sql):
+        _p = ("This question failed verification: independent analysts reading it wrote DIFFERENT "
+              "SQL. Rewrite it to unambiguously pin down THIS exact query - its result grain (rows "
+              "vs entities), the exact returned quantities, explicit top-N and filters, literal "
+              "dates - while staying natural business language.\nSQL: " + sql
+              + "\nFailed question: " + question + "\nReturn ONLY the rewritten question.")
+        try:
+            _r = openai_client.chat.completions.create(
+                model=GENERATOR_ENDPOINT, messages=[{"role": "user", "content": _p}],
+                max_tokens=400, temperature=0.3)
+            _nq = (_r.choices[0].message.content or "").strip().strip('"')
+            return _nq or question
+        except Exception:
+            return question
+
+    print(f"Trust gate: k={VERIFICATION_K} panel "
+          f"({sum(1 for f, _, _ in _PANEL if f == 'gen')} generator-family + "
+          f"{sum(1 for f, _, _ in _PANEL if f == 'judge')} judge-family) over {len(validated_pdf)} pairs…")
+    _tiers, _agreements, _emp_diff, _q_orig, _repaired_flags = [], [], [], [], []
+    _n_repaired = 0
+    for _i, _row in validated_pdf.iterrows():
+        _gateable_pair = bool(_row["sql_executes"]) and bool(_row["nonempty_result"]) \
+            and bool(_row.get("sql_deterministic", True))
+        if not _gateable_pair:
+            _tiers.append("not_evaluable"); _agreements.append(None)
+            _emp_diff.append("unknown"); _q_orig.append(""); _repaired_flags.append(False)
+            continue
+        _expected = _parse_rows(_row["expected_rows_json"])
+        _v = _panel_votes(_row["question"], _expected, _PANEL)
+        _tier, _nm, _nv = verify_tier(_v)
+        _orig, _was_repaired = "", False
+        if _tier == "quarantine":
+            _new_q = _repair_question(_row["question"], _row["expected_sql"])
+            if _new_q != _row["question"]:
+                _v2 = _panel_votes(_new_q, _expected, _PANEL[:3])
+                _tier2, _nm2, _nv2 = verify_tier(_v2)
+                if _tier2 in ("gold", "verified"):
+                    _orig, _was_repaired = _row["question"], True
+                    validated_pdf.at[_i, "question"] = _new_q
+                    _tier, _nm, _nv = _tier2, _nm2, _nv2
+                    _n_repaired += 1
+        _tiers.append(_tier)
+        _agreements.append(round(_nm / _nv, 2) if _nv else None)
+        _emp_diff.append(empirical_difficulty(_nm, _nv))
+        _q_orig.append(_orig); _repaired_flags.append(_was_repaired)
+        print(f"  [{_i}] {_tier:<13} agree={_nm}/{_nv} diff={_emp_diff[-1]:<7} {_row['question'][:70]}")
+
+    validated_pdf["verify_tier"] = _tiers
+    validated_pdf["verify_agreement"] = _agreements
+    validated_pdf["difficulty_empirical"] = _emp_diff
+    validated_pdf["question_orig"] = _q_orig
+    validated_pdf["verify_repaired"] = _repaired_flags
+
+    _gated = [x for x in _tiers if x != "not_evaluable"]
+    _n_gold = _tiers.count("gold"); _n_ver = _tiers.count("verified"); _n_quar = _tiers.count("quarantine")
+    _vf = (_n_gold + _n_ver) / len(_gated) if _gated else 0.0
+    print(f"\nTrust gate: verified_fraction={_vf:.0%} (gold {_n_gold} + verified {_n_ver} of "
+          f"{len(_gated)} gated; quarantine {_n_quar}; repaired {_n_repaired})")
+    with mlflow.start_run(run_name="eval_set_verification"):
+        _tag_run()
+        mlflow.log_param("genie_space_id", GENIE_SPACE_ID)
+        mlflow.log_param("verification_k", VERIFICATION_K)
+        mlflow.log_param(
+            "meaning",
+            "execution-verified by two model families under the space's declared semantics — "
+            "agreement certificates, NOT accuracy")
+        mlflow.log_metric("n_gated", len(_gated))
+        mlflow.log_metric("verified_fraction", _vf)
+        mlflow.log_metric("gold_count", _n_gold)
+        mlflow.log_metric("verified_count", _n_ver)
+        mlflow.log_metric("quarantine_count", _n_quar)
+        mlflow.log_metric("repaired_count", _n_repaired)
+        _ag = [a for a in _agreements if a is not None]
+        if _ag:
+            mlflow.log_metric("mean_panel_agreement", sum(_ag) / len(_ag))
+else:
+    print(f"Trust gate: skipped — verification_k={VERIFICATION_K} (set ≥2 to compute it).")
+
 
 # COMMAND ----------
 
@@ -1115,6 +1528,8 @@ with mlflow.start_run(run_name="eval_set_quality") as run:
     mlflow.log_param("n_eval_items", len(validated_pdf))
     mlflow.log_metric("fraction_sql_executes", float(validated_pdf["sql_executes"].mean()))
     mlflow.log_metric("fraction_nonempty", float(validated_pdf["nonempty_result"].mean()))
+    if COLUMN_COVERAGE is not None:
+        mlflow.log_metric("column_coverage", COLUMN_COVERAGE)
     eval_result = mlflow.genai.evaluate(
         data=judge_df,
         scorers=[Safety(), question_clarity, sql_answers_question, grounded_literals, sql_valid],
@@ -1424,150 +1839,7 @@ def run_one_genie(question: str) -> dict:
         }
 
 
-from collections import Counter as _Counter
-from decimal import Decimal as _Decimal
-
-
-def _parse_rows(s: str):
-    """Parse a stored rows-JSON string to a list of row-lists, or None if blank/invalid."""
-    if not s:
-        return None
-    try:
-        rows = json.loads(s)
-    except Exception:
-        return None
-    return rows or []
-
-
-_NUM_STR_RE = re.compile(r"^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$")
-
-
-def _dec_fmt(d: _Decimal) -> str:
-    if d == 0:
-        d = _Decimal(0)                            # normalize -0 / "-0.0" to 0
-    return format(d.normalize(), "f")
-
-
-def _canon_cell(v) -> str:
-    """Canonicalize a cell so cross-engine formatting (1 vs 1.0, Decimal, None, bool) doesn't
-    cause a false mismatch. The warehouse returns every value as a string in data_array. Uses
-    Decimal (not float) so big integers keep full precision, and preserves codes with leading
-    zeros (zips/phones/IDs) instead of coercing them to numbers (caught live)."""
-    if v is None:
-        return "\x00NULL"
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, _Decimal):
-        return _dec_fmt(v)
-    if isinstance(v, int):
-        return str(v)                              # exact — no float precision loss
-    if isinstance(v, float):
-        return _dec_fmt(_Decimal(str(v)))
-    s = str(v).strip()
-    core = s.lstrip("+-")
-    # coerce genuinely-numeric strings (incl. scientific notation), but keep leading-zero
-    # codes (e.g. "01234" zips/IDs) verbatim
-    leading_zero_code = len(core) > 1 and core[0] == "0" and not core.startswith("0.")
-    if _NUM_STR_RE.match(s) and not leading_zero_code:
-        try:
-            return _dec_fmt(_Decimal(s))
-        except Exception:
-            return s
-    return s
-
-
-def _cells_close(a: str, b: str) -> bool:
-    """Numeric-tolerant equality on CANONICAL cells: exact match, or both numeric and within
-    0.1% relative (1e-9 absolute near zero). Absorbs ROUND()/float-path differences between
-    semantically identical SQL (caught live: 16.67 vs 16.666666… scored as a miss)."""
-    if a == b:
-        return True
-    # Tolerance is for ROUND()/float-path differences — it only applies when a side has a
-    # fractional part. Integer-valued cells (counts, IDs) must match EXACTLY: the old behavior
-    # bridged 999 vs 1000 at any scale >= 999 (cold-review board).
-    if "." not in a and "." not in b:
-        return False
-    try:
-        da, db = _Decimal(a), _Decimal(b)
-    except Exception:
-        return False
-    diff = abs(da - db)
-    if diff <= _Decimal("1e-9"):
-        return True
-    scale = max(abs(da), abs(db))
-    return (diff / scale) <= _Decimal("0.001")
-
-
-def _match_with_permutation(E, G, tolerant: bool) -> bool:
-    """Match row multisets under ONE consistent column permutation (alias / column-order
-    invariance). Replaces per-row cell-sorting, which let CROSS-COLUMN VALUE SWAPS falsely
-    pass (e.g. [[1,2],[3,4]] vs [[2,1],[3,4]]) — a false PASS inflates the lower bound."""
-    from itertools import permutations as _perms
-    ncols = len(E[0])
-    ce = _Counter(E)
-    for p in _perms(range(ncols)):
-        Gp = [tuple(g[i] for i in p) for g in G]
-        if not tolerant:
-            if ce == _Counter(Gp):
-                return True
-        else:
-            used = [False] * len(Gp)
-            ok = True
-            for e in E:
-                hit = False
-                for j, g in enumerate(Gp):
-                    if not used[j] and all(_cells_close(x, y) for x, y in zip(e, g)):
-                        used[j] = True
-                        hit = True
-                        break
-                if not hit:
-                    ok = False
-                    break
-            if ok:
-                return True
-    return False
-
-
-def rows_match(expected_rows, genie_rows, row_cap: int = 50):
-    """Multiset row comparison. Returns True / False / None.
-
-    - multiset, NOT a set — duplicate rows are preserved, so a wrong-cardinality answer
-      can't pass by silent dedup.
-    - column-order/alias invariant via ONE consistent column permutation across all rows
-      (not per-row cell sorting, which falsely passed cross-column swaps).
-    - numeric-tolerant fallback (_cells_close) absorbs ROUND()/float-path differences.
-    - None = NOT-EVALUABLE: excluded from the rate (neither pass nor fail). Two cases:
-        (a) no expected baseline (expected_sql failed / permission-denied) — scoring this as a
-            Genie miss falsely deflated concordance on perm-gated tables (caught live); and
-        (b) a side exceeded the row cap (collectors fetch cap+1 rows, so len > cap means the
-            result was truncated; len == cap is a complete result and stays determinate)."""
-    if expected_rows is None:
-        return None   # no baseline captured → not-evaluable, NOT a Genie miss
-    if genie_rows is None:
-        return False  # we have a baseline but Genie returned nothing → real miss
-    if len(expected_rows) > row_cap or len(genie_rows) > row_cap:
-        return None
-    E = [tuple(_canon_cell(v) for v in (r or [])) for r in expected_rows]
-    G = [tuple(_canon_cell(v) for v in (r or [])) for r in genie_rows]
-    if len(E) != len(G):
-        return False
-    if not E:
-        # Both empty: uninformative — two unrelated wrong queries that each return nothing must
-        # not count as agreement (cold-review board). Excluded from the rate.
-        return None
-    if _Counter(E) == _Counter(G):
-        return True   # fast path: same column order (safe at any width)
-    ncols = len(E[0])
-    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
-        return False
-    if ncols > 7:
-        # Permutation search is infeasible past 7 columns and the old sorted-cell fallback
-        # admitted false PASSes (inconsistent cross-column swaps). Wide results that don't
-        # match in-order are NOT-EVALUABLE rather than leniently matched.
-        return None
-    if _match_with_permutation(E, G, tolerant=False):
-        return True
-    return _match_with_permutation(E, G, tolerant=True)
+# (row-matching helpers are defined in the Trust-Gate cell — Phase 5.5 — above.)
 
 
 # Run questions in parallel — Genie calls are I/O-bound and one can take 30-60s.
@@ -1580,6 +1852,12 @@ from concurrent.futures import ThreadPoolExecutor
 # An unfiltered read ran foreign spaces' questions against this Genie AND poisoned the
 # scoped write downstream (cold-review board, critical).
 eval_pub_pdf = spark.table(EVAL_SET_TABLE).where(F.col("genie_space_id") == GENIE_SPACE_ID).toPandas()
+if "verify_tier" in eval_pub_pdf.columns:
+    _vt = eval_pub_pdf["verify_tier"]
+    _excl = int((~(_vt.isin(["gold", "verified"]) | _vt.isna())).sum())
+    if _excl:
+        print(f"Excluding {_excl} non-verified item(s) from the regression (quarantine/not-evaluable).")
+        eval_pub_pdf = eval_pub_pdf[_vt.isin(["gold", "verified"]) | _vt.isna()]
 if "sql_deterministic" in eval_pub_pdf.columns:
     _n_nondet = int((eval_pub_pdf["sql_deterministic"] == False).sum())  # noqa: E712
     if _n_nondet:

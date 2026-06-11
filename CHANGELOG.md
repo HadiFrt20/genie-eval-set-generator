@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### The trust gate ships — execution-verified answer keys (P0 + P1)
+
+The roadmap's verification stage is now in the notebook (`verification_k`, default 5):
+
+- **Cross-family solver panel:** k independent derivations (generator family at temps 0/0.4/0.8 +
+  judge family at 0/0.5) re-write each pair's SQL from the question alone — under **context parity**
+  (the panel sees the space's instructions + curated questions, the same declared semantics Genie
+  has; verified necessary by live experiment). Executed results are compared with the same matcher
+  that grades Genie.
+- **Tiers:** GOLD (unanimous, both families) / VERIFIED (majority, both families) / QUARANTINE
+  (kept + published with its tier, excluded from the Genie regression, surfaced as the human-review
+  queue). One question-rewrite repair iteration runs before quarantining (5/7 recovery measured in
+  the design experiments). `verified_fraction` is the new headline, labelled *execution-verified by
+  two model families* — never "accuracy".
+- **Empirical difficulty** (1 − panel pass rate: easy/medium/hard/suspect) ships as a free byproduct;
+  `suspect` items (zero panel matches) are concentrated wrong-key candidates.
+- **P0 deterministic guards** (sqlglot): typed lint rejects numeric aggregates over string/boolean
+  columns and unparseable SQL; **literals-masked skeleton dedup** removes structural duplicates the
+  question-embedding dedup can't see; column-coverage % is measured and logged.
+- App scorecard: new "Trust gate" card + "Verified pairs" headline tile; concordance is computed on
+  verified pairs only when the gate ran.
+- 24 known-answer tests (tier logic, empirical difficulty, skeleton dedup key).
+
+
 ### Generation robustness (live context-parity experiments)
 
 Three live experiments on instruction-bearing spaces surfaced four generation failure classes,

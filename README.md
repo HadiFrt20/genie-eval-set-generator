@@ -79,10 +79,15 @@ Live A/B experiments on real Genie spaces (single- and multi-table) shaped where
 - **A one-iteration repair loop** (rewrite the question to pin down the query's semantics, re-verify)
   recovered most remaining failures.
 
-The next release builds this in as a **verification stage**: k independent SQL derivations across two model
-families, execution-consensus clustering, and a per-pair certificate — `verified_fraction` becomes the
-headline metric (labelled *execution-verified by two model families*, deliberately never "accuracy"), with
-unverified pairs quarantined for human review instead of silently shipped. Grounding:
+**This now ships as the trust gate** (`verification_k`, default 5): for every validated pair, k
+independent solvers — interleaved across two model families at varied temperatures — receive only the
+question plus the space's *declared semantics* (instructions + curated questions: context parity with
+Genie) and re-derive the SQL blind; executed results are compared to the expected rows. Pairs earn
+**GOLD** (panel unanimous, both families), **VERIFIED** (majority, both families), or **QUARANTINE**
+(kept + flagged, excluded from the regression, first in the human-review queue — after one
+question-rewrite repair attempt). `verified_fraction` is the headline metric, labelled
+*execution-verified by two model families* — deliberately never "accuracy", since two families can
+still share a misreading. Free byproduct: **empirical difficulty** = 1 − panel pass rate. Grounding:
 [GAZP](https://arxiv.org/abs/2009.07396), [OmniSQL](https://arxiv.org/abs/2503.02240),
 [CHASE-SQL](https://arxiv.org/abs/2410.01943) (multi-candidate generation; the consensus pick itself
 follows self-consistency, [Wang et al. 2022](https://arxiv.org/abs/2203.11171)), and
@@ -111,7 +116,8 @@ You don't need any of these terms to *run* the tool — this is just how to read
 | **Grounding** | Do the questions' filter values come from real column values (not invented)? | A heuristic flag over string literals only — numeric/date filters aren't checked; "not evaluable" when there's nothing to check against. |
 | **Quality** | Are the questions clear, and does each SQL actually answer its question? | *Uncalibrated LLM-judge* opinions — directional, not gospel. |
 | **Diversity & leakage** | Are the questions varied, or near-copies of the examples? | Descriptive numbers + one `leakage` flag (too close to the reference). |
-| **Concordance** | How often did Genie's answer match the expected one? | A **lower bound** — see the caution above. Shown per difficulty (how complex the SQL is) and category (totals/rankings/trends/ratios), with counts. |
+| **Verification** | Is the answer key itself trustworthy? | Trust-gate tiers (GOLD / VERIFIED / QUARANTINE) from a cross-family solver panel; `verified_fraction` of gated pairs. Quarantine = your review queue. Needs `verification_k ≥ 2`. |
+| **Concordance** | How often did Genie's answer match the expected one? | Computed on **verified pairs only** when the trust gate ran (else a lower bound — see the caution above). Shown per difficulty and category, with counts. |
 | **Reliability** | If you re-ask the same questions, do you get the same result? | Agreement across reruns + a confidence interval on the rate (needs `stability_runs ≥ 2`; treats questions as independent draws — clustered generation can make the interval optimistic). |
 
 ## Quickstart
@@ -147,6 +153,7 @@ Prefer no app? Upload `genie_eval_set_generator.py` and run it with widget value
 | `uc_catalog` / `uc_schema` | `main` / `genie_eval` | Where the eval tables + prompt registry live (the bundle sets the catalog via `--var=output_catalog`) |
 | `questions_per_table` | `14` | 14 = a fast preview; 100+ **per table** for numbers solid enough to gate a release on (total questions = this × #tables) |
 | `stability_runs` | `1` | Re-ask each question this many times (≥2 to measure reliability; 3+ for a stable number) |
+| `verification_k` | `5` | Trust-gate panel size (0 = skip; 5 = 3 generator-family + 2 judge-family solvers) |
 | `embedding_endpoint` | `…bge-large-en` | Powers the diversity/leakage check (blank = skip it) |
 | `generator_endpoint` / `judge_endpoint` | `…llama-4-maverick` / `…claude-sonnet-4-5` | Question generator + LLM judge |
 

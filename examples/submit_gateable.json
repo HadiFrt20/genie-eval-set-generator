@@ -23,7 +23,8 @@
           "embedding_endpoint": "databricks-bge-large-en",
           "stability_runs": "3",
           "include_historical_in_context": "false",
-          "run_prompt_optimization": "false"
+          "run_prompt_optimization": "false",
+          "verification_k": "5"
         }
       },
       "environment_key": "env"
@@ -32,7 +33,9 @@
   "environments": [
     {
       "environment_key": "env",
-      "spec": {"client": "3", "environment_version": "3"}
+      "spec": {
+        "environment_version": "3"
+      }
     }
   ]
 }

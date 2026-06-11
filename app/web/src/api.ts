@@ -118,6 +118,17 @@ export interface ScorecardData {
     n_needed_for_target: number | null
     gate_max_half_width_pp: number | null
   }
+  // Trust gate (Phase 5.5): execution-verified by two model families — certificates, not accuracy.
+  verification: {
+    computed: boolean
+    verified_fraction: number | null
+    gold_count: number | null
+    verified_count: number | null
+    quarantine_count: number | null
+    repaired_count: number | null
+    mean_panel_agreement: number | null
+    n_gated: number | null
+  }
   quality: {
     sql_executes: number | null
     nonempty: number | null

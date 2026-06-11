@@ -232,6 +232,8 @@ function ScorecardBody({
 }) {
   const d = data.diversity ?? {}
   const rel = data.reliability ?? {}
+  const ver = data.verification ?? {}
+  const verComputed = ver.computed === true || String(ver.computed) === 'true'
   const q = data.quality ?? {}
   const reg = data.regression ?? {}
   const diversityComputed = d.computed !== false
@@ -283,13 +285,61 @@ function ScorecardBody({
           }
           hint={!relComputed ? 'set stability_runs ≥ 2' : undefined}
         />
+        {verComputed ? (
+          <MetricTile
+            label="Verified pairs"
+            value={formatPercent(ver.verified_fraction)}
+            hint="execution-verified, two model families"
+          />
+        ) : null}
         <MetricTile
           label="Row concordance"
           value={formatPercent(reg.pass_rate_deterministic)}
-          hint="lower bound — vs synthetic SQL"
+          hint={verComputed ? 'on verified pairs only' : 'lower bound — vs synthetic SQL'}
         />
         <MetricTile label="SQL executes" value={formatPercent(q.sql_executes)} />
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Trust gate — answer-key verification</CardTitle>
+          <p className="text-xs text-muted-foreground">
+            k independent solvers across two model families re-derive each answer blind (with the
+            space's declared semantics) and execution results are compared. Certificates, not
+            accuracy. Quarantined pairs are kept + flagged and excluded from the regression.
+          </p>
+        </CardHeader>
+        <CardContent>
+          {!verComputed ? (
+            <p className="text-sm text-muted-foreground">
+              Not computed — set <code>verification_k</code> ≥ 2 to enable the trust gate.
+            </p>
+          ) : (
+            <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+              <MetricTile
+                label="Verified"
+                value={formatPercent(ver.verified_fraction)}
+                hint={`of ${ver.n_gated ?? '—'} gated pairs`}
+              />
+              <MetricTile
+                label="Gold / Verified"
+                value={`${ver.gold_count ?? '—'} / ${ver.verified_count ?? '—'}`}
+                hint="unanimous / majority"
+              />
+              <MetricTile
+                label="Quarantine"
+                value={String(ver.quarantine_count ?? '—')}
+                hint="review queue (excluded from regression)"
+              />
+              <MetricTile
+                label="Repaired"
+                value={String(ver.repaired_count ?? '—')}
+                hint={`mean agreement ${formatNumber(ver.mean_panel_agreement, 2) ?? '—'}`}
+              />
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

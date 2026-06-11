@@ -183,6 +183,35 @@ def norm_q(s: str) -> str:
     return " ".join((s or "").strip().lower().split()).rstrip("?.! ")
 
 
+# --- v0.3 trust-gate mirrors (verify_tier / empirical_difficulty / sql skeleton) ---------------
+
+def verify_tier(votes):
+    valid = [(f, v) for f, v in votes if v is not None]
+    n_votes = len(valid)
+    n_match = sum(1 for _, v in valid if v)
+    if n_votes == 0:
+        return "not_evaluable", 0, 0
+    fams_matched = {f for f, v in valid if v}
+    if n_match == n_votes and len(fams_matched) >= 2:
+        return "gold", n_match, n_votes
+    if n_match * 2 > n_votes and len(fams_matched) >= 2:
+        return "verified", n_match, n_votes
+    return "quarantine", n_match, n_votes
+
+
+def empirical_difficulty(n_match, n_votes):
+    if n_votes == 0:
+        return "unknown"
+    rate = n_match / n_votes
+    if n_match == 0:
+        return "suspect"
+    if rate >= 0.8:
+        return "easy"
+    if rate >= 0.4:
+        return "medium"
+    return "hard"
+
+
 # --- tests -----------------------------------------------------------------------------------
 
 def _approx(a, b, tol=1e-3):
@@ -364,6 +393,56 @@ def test_cohen_kappa():
     assert _approx(cohen_kappa([1, 0, 1, 0], [0, 1, 0, 1]), -1.0)    # perfect disagreement
     assert cohen_kappa([1, 1, 1, 1], [1, 1, 1, 1]) == 1.0            # constant + identical
     assert to_binary("PASS") == 1 and to_binary("fail") == 0
+
+
+def test_verify_tier():
+    T, F, N = True, False, None
+    # gold: unanimous, both families
+    assert verify_tier([("gen", T), ("judge", T)])[0] == "gold"
+    # verified: strict majority + a match from each family
+    assert verify_tier([("gen", T), ("judge", T), ("gen", F)])[0] == "verified"
+    # single-family unanimity is NOT a two-family certificate -> quarantine
+    assert verify_tier([("gen", T), ("gen", T), ("gen", T), ("judge", F), ("judge", F)])[0] == "quarantine"
+    # exact tie is not a majority -> quarantine
+    assert verify_tier([("gen", T), ("judge", F), ("gen", F), ("judge", T)])[0] == "quarantine"
+    # not-evaluable votes are excluded, remaining can still be gold
+    assert verify_tier([("gen", T), ("judge", N), ("judge", T)])[0] == "gold"
+    # all not-evaluable
+    assert verify_tier([("gen", N), ("judge", N)])[0] == "not_evaluable"
+
+
+def test_empirical_difficulty():
+    assert empirical_difficulty(0, 5) == "suspect"
+    assert empirical_difficulty(1, 5) == "hard"      # 0.2
+    assert empirical_difficulty(2, 5) == "medium"    # 0.4
+    assert empirical_difficulty(4, 5) == "easy"      # 0.8
+    assert empirical_difficulty(5, 5) == "easy"
+    assert empirical_difficulty(0, 0) == "unknown"
+
+
+def test_sql_skeleton_dedup_key():
+    try:
+        import sqlglot
+        from sqlglot import exp as sgexp
+    except ImportError:
+        print("  (sqlglot not installed — skeleton test skipped)")
+        return
+
+    def skeleton(sql):
+        tree = sqlglot.parse_one(sql, read="spark")
+        def mask(node):
+            if isinstance(node, sgexp.Literal):
+                return sgexp.Literal.string("?") if node.is_string else sgexp.Literal.number(0)
+            return node
+        return tree.copy().transform(mask).sql(dialect="spark", normalize=True)
+
+    # same structure, different literals -> SAME skeleton (structural duplicate)
+    a = skeleton("SELECT region, SUM(sales) FROM t WHERE year = 2023 AND region = 'East' GROUP BY region")
+    b = skeleton("SELECT region, SUM(sales) FROM t WHERE year = 2024 AND region = 'West' GROUP BY region")
+    assert a == b
+    # different column -> DIFFERENT skeleton (identifiers are kept)
+    c = skeleton("SELECT region, SUM(profit) FROM t WHERE year = 2023 GROUP BY region")
+    assert a != c
 
 
 if __name__ == "__main__":
