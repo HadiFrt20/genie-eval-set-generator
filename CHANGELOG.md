@@ -31,6 +31,11 @@ The roadmap's verification stage is now in the notebook (`verification_k`, defau
 - App scorecard: new "Trust gate" card + "Verified pairs" headline tile; concordance is computed on
   verified pairs only when the gate ran.
 - 24 known-answer tests (tier logic, empirical difficulty, skeleton dedup key).
+- **First live end-to-end run** (full notebook as a serverless job, instruction-rich space):
+  verified_fraction **86%** (6 GOLD of 7 gated pairs; the repair loop recovered 2; 1 quarantined for
+  review); the Genie regression then ran on the verified pairs only — concordance 67%, all pairs
+  graded same-engine, 0 indeterminate. With verified keys, the misses are findings about Genie, not
+  about the answer key.
 
 
 ### Generation robustness (live context-parity experiments)
