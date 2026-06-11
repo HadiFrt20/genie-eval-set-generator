@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Verification-driven fixes (post-release reviews + live A/B experiments)
+
+- **Matcher v2** (`rows_match`): column-order/alias invariance is now ONE consistent column permutation
+  across all rows — per-row cell-sorting let inconsistent cross-column value swaps falsely PASS, which
+  inflated the lower bound; added a 0.1%-relative / 1e-9-absolute numeric-tolerance fallback so
+  ROUND()/float-path differences between semantically identical SQL no longer score as misses.
+  Cascade: exact → consistent-permutation → tolerant. 19 known-answer tests.
+- **Question contract** (generation prompt rules 9–11): every question must name its result grain
+  (rows vs entities), state exactly which quantities to return, and use literal date anchors (no
+  NOW()/relative windows). Measured effect in live A/B: pairs surviving independent round-trip
+  verification went from ~38% to 83–100%.
+- **Scorecard run attribution**: notebook tags MLflow runs with the Jobs run-id; the app filters on it
+  (untagged runs fall back to latest-in-experiment with a visible warning) — two runs sharing an
+  experiment no longer show each other's results.
+- **Contamination filter persistence**: new append-only `genie_eval_synthetic_log` table + per-space
+  `replaceWhere` writes — previously each run's full-table overwrite erased the very history the filter read.
+- Genie API errors are excluded from the concordance rate (not scored as misses); concordance ties across
+  reruns count as fail (conservative); complete 50-row results are determinate (collectors fetch cap+1);
+  scientific-notation and negative-zero values canonicalize; the diversity merge keys on `question_id`;
+  the app follows SQL result chunks and backticks identifiers; README documents how the app actually starts.
+- README: measured roadmap section — execution-verified answer keys (round-trip consensus, repair loop,
+  `verified_fraction` with quarantine) grounded in the live experiments and the synthetic-SQL literature.
+
 ### BREAKING — honest-measurement overhaul (v0.1 strip → v0.2 rebuild)
 
 An adversarial review of the methodology found that several inferential statistics were not valid as

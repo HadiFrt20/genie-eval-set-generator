@@ -58,7 +58,27 @@ the regression — and is upfront about the 20% a human still needs to eyeball.
 
 > *Earlier iterations leaned on heavier statistics (a "realism" z-score, a reliability gate) that didn't hold
 > up under scrutiny, so they were removed in favour of the plainer, conservative reads above. Re-earning that
-> rigor properly — independently-verified answer keys, calibrated judges — is the active roadmap.*
+> rigor properly — independently-verified answer keys, calibrated judges — is the active roadmap (below).*
+
+### Roadmap: from "lower bound" to execution-verified answer keys
+
+Live A/B experiments on real Genie spaces (single- and multi-table) shaped where this goes next:
+
+- **Round-trip verification works.** Having an *independent model family* re-derive SQL from the question
+  alone and comparing executed results caught answer keys that were provably wrong (e.g. row-grain
+  aggregates answering entity-grain questions) — errors nothing in the original pipeline could detect.
+- **Question precision is most of the battle.** With explicit result-grain / returned-quantities / literal-date
+  rules in the generation prompt (now shipped), 83–100% of generated pairs survived independent
+  verification, vs ~38% without them.
+- **A one-iteration repair loop** (rewrite the question to pin down the query's semantics, re-verify)
+  recovered most remaining failures.
+
+The next release builds this in as a **verification stage**: k independent SQL derivations across two model
+families, execution-consensus clustering, and a per-pair certificate — `verified_fraction` becomes the
+headline metric (labelled *execution-verified by two model families*, deliberately never "accuracy"), with
+unverified pairs quarantined for human review instead of silently shipped. Grounding:
+[GAZP](https://arxiv.org/abs/2009.07396), [OmniSQL](https://arxiv.org/abs/2503.02240),
+[CHASE-SQL](https://arxiv.org/abs/2410.01943), [FLEX](https://arxiv.org/abs/2409.19014).
 
 ---
 
@@ -126,7 +146,9 @@ depth, low-cardinality cap, prompt overrides) — they're documented on each wid
 ## Good to know (limits)
 
 1. **Concordance is a lower bound, not correctness** — the answer key is machine-generated and, when you
-   lack access to the space's own warehouse, graded on a different engine.
+   lack access to the space's own warehouse, graded on a different engine. Matching is forgiving where it
+   should be (one consistent column reordering across all rows; 0.1% numeric tolerance for ROUND()/float
+   differences) and strict where it must be (duplicates preserved; inconsistent cross-column swaps fail).
 2. **The LLM judges aren't calibrated against human labels** — read their scores as opinions.
 3. **Diversity needs a reference** — it runs only with an embedding endpoint and enough example/history
    questions; sparse spaces correctly skip it.
