@@ -43,7 +43,7 @@ def rerun_agreement(matrix):
 
 
 def question_concordance(matrix):
-    """Question-level concordance: a question 'passes' if its mean valid-rerun pass >= 0.5.
+    """Question-level concordance: a question 'passes' if its mean valid-rerun pass is STRICTLY > 0.5 (tie = fail).
     Unit of analysis = question with >=1 valid rerun (NOT N*M cells)."""
     q_pass = []
     for row in matrix:
@@ -100,6 +100,8 @@ def canon_cell(v) -> str:
 def cells_close(a, b):
     if a == b:
         return True
+    if "." not in a and "." not in b:
+        return False  # integer-valued cells must match exactly (999 vs 1000 must FAIL)
     try:
         da, db = Decimal(a), Decimal(b)
     except Exception:
@@ -114,10 +116,6 @@ def cells_close(a, b):
 def match_with_permutation(E, G, tolerant):
     from itertools import permutations
     ncols = len(E[0])
-    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
-        return False
-    if ncols > 7:
-        return Counter(tuple(sorted(r)) for r in E) == Counter(tuple(sorted(r)) for r in G)
     ce = Counter(E)
     for p in permutations(range(ncols)):
         Gp = [tuple(g[i] for i in p) for g in G]
@@ -154,9 +152,14 @@ def rows_match(expected_rows, genie_rows, row_cap=50):
     if len(E) != len(G):
         return False
     if not E:
-        return True
+        return None  # both empty: uninformative, excluded from the rate
     if Counter(E) == Counter(G):
-        return True
+        return True  # same column order — safe at any width
+    ncols = len(E[0])
+    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
+        return False
+    if ncols > 7:
+        return None  # wide results: permutation search infeasible; lenient fallback removed
     if match_with_permutation(E, G, tolerant=False):
         return True
     return match_with_permutation(E, G, tolerant=True)
@@ -274,8 +277,13 @@ def test_rows_match_numeric_tolerance():
     assert rows_match([["33.333333"]], [["33.33"]]) is True
     # genuinely different values -> no match
     assert rows_match([["33.33"]], [["34.0"]]) is False
-    # tolerance must not bridge distinct integers
+    # tolerance must NEVER bridge distinct integer-valued cells, at any scale
     assert rows_match([["1000"]], [["1002"]]) is False
+    assert rows_match([["999"]], [["1000"]]) is False
+    assert rows_match([["1000000"]], [["1000999"]]) is False
+    # fractional cells still tolerate ROUND()/float differences (0.1% relative)
+    assert rows_match([["33.333333"]], [["33.34"]]) is True   # 0.02% diff: within tolerance
+    assert rows_match([["33.3"]], [["33.5"]]) is False        # 0.6% diff: genuinely different
 
 
 def test_rows_match_cap_indeterminate():
@@ -293,6 +301,21 @@ def test_rows_match_none_semantics():
     assert rows_match(None, [[1]]) is None
     # we DO have a baseline but Genie returned nothing -> real miss (False)
     assert rows_match([[1]], None) is False
+
+
+def test_rows_match_wide_results():
+    # >7 columns: same-order exact match still works at any width...
+    wide = [list(range(8))]
+    assert rows_match(wide, [list(range(8))]) is True
+    # ...but reordered/swapped wide rows are NOT-EVALUABLE (the old sorted-cell fallback
+    # falsely PASSED inconsistent cross-column swaps here)
+    swapped = [[1, 0] + list(range(2, 8))]
+    assert rows_match(wide, swapped) is None
+
+
+def test_rows_match_empty_uninformative():
+    # two queries that both return nothing is not evidence of agreement
+    assert rows_match([], []) is None
 
 
 def test_canon_cell_scientific_and_negative_zero():

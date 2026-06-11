@@ -69,6 +69,9 @@ export default function ConfigurePage() {
   }, [detail.data])
 
   const autoCatalog = tables[0]?.split('.')[0] ?? 'main'
+  // Prefer the catalog the bundle prepared (USE CATALOG/MODIFY already granted) over the
+  // space's data catalog, where the app SP typically has no write grants.
+  const envCatalog = health.data?.default_output_catalog ?? ''
   const host = health.data?.host ?? ''
 
   const [form, setForm] = useState<FormState | null>(null)
@@ -78,7 +81,7 @@ export default function ConfigurePage() {
     if (form || !spaceId || !me.data) return
     const user = me.data.user_name || 'shared'
     setForm({
-      uc_catalog: autoCatalog,
+      uc_catalog: envCatalog || autoCatalog,
       uc_schema: 'genie_eval',
       mlflow_experiment_path: `/Users/${user}/genie_eval_${spaceId.slice(0, 8)}`,
       questions_per_table: '14',
@@ -99,7 +102,7 @@ export default function ConfigurePage() {
       custom_min_pooled_pass: '0.10',
       custom_max_pooled_pass: '0.90',
     })
-  }, [autoCatalog, host, spaceId, form, me.data])
+  }, [autoCatalog, envCatalog, host, spaceId, form, me.data])
 
   // When health/detail land later, top up the catalog/gateway if user hasn't edited
   useEffect(() => {
@@ -280,7 +283,7 @@ export default function ConfigurePage() {
                 id="qpt"
                 type="number"
                 min={1}
-                max={80}
+                max={300}
                 value={form.questions_per_table}
                 onChange={(e) =>
                   update('questions_per_table', e.target.value)

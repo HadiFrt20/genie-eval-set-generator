@@ -92,11 +92,15 @@ def _main(argv: list[str]) -> int:
     print(f"{'judge':<24} {'n':>4} {'kappa':>7} {'agree':>7} {'judge+':>7} {'human+':>7}  verdict")
     failed = 0
     for judge, s in stats.items():
-        gated = s["n"] >= 10
+        single_class = s["human_pos_rate"] in (0.0, 1.0)
+        gated = s["n"] >= 10 and not single_class
         ok = (not gated) or s["kappa"] >= floor
         if gated and not ok:
             failed += 1
-        verdict = "—" if not gated else ("OK" if ok else f"BELOW κ {floor}")
+        if s["n"] >= 10 and single_class:
+            verdict = "not calibratable (single-class human labels)"
+        else:
+            verdict = "—" if not gated else ("OK" if ok else f"BELOW κ {floor}")
         print(f"{judge:<24} {s['n']:>4} {s['kappa']:>7.3f} {s['raw_agreement']:>7.3f} "
               f"{s['judge_pos_rate']:>7.2f} {s['human_pos_rate']:>7.2f}  {verdict}")
     print(f"\n{'PASS' if not failed else 'FAIL'} — {failed} judge(s) below the κ floor "

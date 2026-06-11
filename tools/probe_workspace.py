@@ -32,9 +32,10 @@ except Exception as e:  # pragma: no cover
 # Reuse the exact row-matching + difficulty logic the notebook ships (mirrored in tests).
 sys.path.insert(0, __file__.rsplit("/", 2)[0] + "/tests")
 try:
-    from test_stats import rows_match, structural_difficulty, canon_row  # type: ignore
-except Exception:
-    rows_match = structural_difficulty = canon_row = None
+    from test_stats import rows_match, structural_difficulty  # type: ignore
+except Exception as _e:  # fail LOUD: a silent null here disabled the deep row-match check before
+    print(f"WARNING: could not import matcher from tests/test_stats.py ({_e}) — deep checks disabled")
+    rows_match = structural_difficulty = None
 
 
 RESULTS: list[dict] = []

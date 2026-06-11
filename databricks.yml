@@ -34,6 +34,10 @@ variables:
 sync:
   include:
     - genie_eval_set_generator.py
+    # The built frontend is gitignored, and DAB sync respects .gitignore — without these
+    # includes the deployed app ships WITHOUT its UI ("Frontend build not found").
+    - app/server/static/**
+    - app/server/static/assets/**
 
 include:
   - resources/*.yml

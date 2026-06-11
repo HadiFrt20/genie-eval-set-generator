@@ -6,6 +6,9 @@ export interface HealthResponse {
   host: string
   authed: boolean
   notebook_path: string
+  obo_dev_fallback?: boolean
+  // bundle-provided default catalog (--var=output_catalog), used as the form's uc_catalog default
+  default_output_catalog?: string
 }
 
 export interface SpaceListItem {

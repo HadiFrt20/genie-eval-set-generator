@@ -177,7 +177,8 @@ def _tag_run():
     if JOB_RUN_ID:
         mlflow.set_tag("job_run_id", JOB_RUN_ID)
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+assert CATALOG.strip() and SCHEMA.strip(), "uc_catalog and uc_schema must be non-blank"
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{CATALOG.strip()}`.`{SCHEMA.strip()}`")
 
 print(f"Genie space:           {GENIE_SPACE_ID}")
 print(f"Tables:                {GENIE_TABLES}")
@@ -801,7 +802,14 @@ def generate_questions_chunk(table_fqn: str, n: int, min_hard: int, focus_label:
             f"Generator returned None content for {table_fqn}/{focus_label} "
             f"(finish_reason={finish}). Likely max_tokens overflow at n={n}."
         )
-    parsed = json.loads(content)
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        finish = getattr(resp.choices[0], "finish_reason", None)
+        raise RuntimeError(
+            f"Generator returned unparseable JSON for {table_fqn}/{focus_label} "
+            f"(finish_reason={finish}; likely max_tokens truncation at n={n}): {e}"
+        )
     questions = parsed.get("questions", [])
     for q in questions:
         q["table"] = table_fqn
@@ -870,6 +878,28 @@ def _selfdedup(items: list[dict], threshold: float = 0.92) -> list[dict]:
         print(f"Self-dedup: skipping due to {e}")
         return items
 
+# Normalize generator items BEFORE anything consumes them: one item missing a key would
+# otherwise become NaN in pandas and crash createDataFrame / structural_difficulty (cold review).
+_norm_items, _dropped_items = [], 0
+for _q in all_questions:
+    if not isinstance(_q, dict) or not str(_q.get("question") or "").strip() \
+            or not str(_q.get("expected_sql") or "").strip():
+        _dropped_items += 1
+        continue
+    _norm_items.append({
+        "question": str(_q["question"]).strip(),
+        "expected_sql": str(_q["expected_sql"]).strip(),
+        "expected_shape": str(_q.get("expected_shape") or ""),
+        "category": str(_q.get("category") or "uncategorized"),
+        "difficulty": str(_q.get("difficulty") or "medium"),
+        "why_non_trivial": str(_q.get("why_non_trivial") or ""),
+        "table": str(_q.get("table") or ""),
+        "_shape_focus": str(_q.get("_shape_focus") or ""),
+    })
+if _dropped_items:
+    print(f"WARNING: dropped {_dropped_items} malformed generator item(s) (missing question/expected_sql)")
+all_questions = _norm_items
+
 all_questions = _selfdedup(all_questions)
 assert all_questions, (
     "Generator returned 0 questions. Check the generator endpoint, the gateway base URL, and that "
@@ -893,7 +923,17 @@ display(spark.createDataFrame(eval_pdf))
 
 # COMMAND ----------
 
+def _is_readonly_sql(sql: str) -> bool:
+    """Only SELECT/WITH statements may execute — the generator is an LLM and nothing else
+    stops it emitting DML/DDL that would mutate real tables with the runner's grants."""
+    import re as _re
+    head = _re.sub(r"^\s*(--[^\n]*\n|/\*.*?\*/\s*)*", "", sql or "", flags=_re.S).lstrip().upper()
+    return head.startswith("SELECT") or head.startswith("WITH")
+
+
 def execute_expected(sql: str):
+    if not _is_readonly_sql(sql):
+        return None, "rejected: only SELECT/WITH statements are executed"
     try:
         rows = [list(r) for r in spark.sql(sql).limit(51).collect()]  # cap+1: 51 rows signals truncation
         return rows, None
@@ -1056,7 +1096,7 @@ with mlflow.start_run(run_name="eval_set_quality") as run:
 # MAGIC   reference itself is. This is NOT a baseline for a hypothesis test; it is shown for comparison only.
 # MAGIC
 # MAGIC The **one** verdict here is a leakage guard:
-# MAGIC - **`leakage_risk = (mean_nn_cosine ≥ 0.97)`** — the synthetic set is near-verbatim copies of
+# MAGIC - **`leakage_risk` = (share of questions with NN cosine ≥ 0.97) ≥ 10%** — part of the set is near-verbatim copies of
 # MAGIC   reference questions, so it cannot catch real Genie mistakes. Everything else is for the SME to read.
 # MAGIC
 # MAGIC Requires `embedding_endpoint` and ≥ `MIN_REF_CORPUS` reference questions; skips with an explicit reason otherwise.
@@ -1140,15 +1180,18 @@ else:
             ref_self_sim = 0.0
 
         # The one verdict: near-verbatim copies of reference questions = leakage (eval set can't
-        # catch real Genie mistakes). Everything else is descriptive, for the SME to read.
-        leakage_risk = bool(mean_nn_cosine >= 0.97)
+        # catch real Genie mistakes). Flag on the FRACTION of near-verbatim items — a mean hides
+        # partial leakage (30% verbatim copies kept the mean under 0.97; cold-review board).
+        leakage_fraction = float((nn_sims >= 0.97).mean())
+        leakage_risk = bool(leakage_fraction >= 0.10)
 
         print("Diversity & leakage (descriptive):")
         print(f"  mean_nn_cosine (P@H)  : {mean_nn_cosine:.3f}  (≈1.0 = near-verbatim copies of reference)")
         print(f"  nn_cosine_p10         : {nn_cosine_p10:.3f}  (low tail = off-vocabulary outliers)")
         print(f"  gen_self_similarity   : {gen_self_sim:.3f}  (lower = more diverse generated set)")
         print(f"  ref_self_similarity   : {ref_self_sim:.3f}  (context: how tight the reference is, n_ref={n_ref})")
-        print(f"  leakage_risk          : {leakage_risk}  (mean_nn_cosine ≥ 0.97)")
+        print(f"  leakage_fraction      : {leakage_fraction:.2f}  (share of questions with nn ≥ 0.97)")
+        print(f"  leakage_risk          : {leakage_risk}  (flag when that share ≥ 0.10)")
 
         per_q_realism_pdf = pd.DataFrame({
             "question_id": validated_pdf["question_id"].tolist(),  # join key: unique, unlike text
@@ -1175,6 +1218,7 @@ else:
             mlflow.log_metric("nn_cosine_p10", nn_cosine_p10)
             mlflow.log_metric("gen_self_similarity", gen_self_sim)
             mlflow.log_metric("ref_self_similarity", ref_self_sim)
+            mlflow.log_metric("leakage_fraction", leakage_fraction)
             mlflow.log_table(per_q_realism_pdf, "diversity_per_question.json")
 
 # COMMAND ----------
@@ -1198,9 +1242,12 @@ def _write_space_scoped(sdf, table_fqn: str):
             .option("mergeSchema", "true")
             .saveAsTable(table_fqn))
     except Exception as e:
-        print(f"WARNING: scoped write to {table_fqn} failed ({str(e)[:160]}) — falling back to a "
-              f"FULL overwrite. Rows from other Genie spaces in this table were dropped.")
-        sdf.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(table_fqn)
+        # NEVER fall back to a full overwrite — that destroys every other space's rows on any
+        # transient failure (concurrency conflict, schema drift). Cold-review board, critical.
+        print(f"WARNING: scoped write to {table_fqn} failed ({str(e)[:160]}) — retrying as "
+              f"DELETE-this-space + append (other spaces' rows are preserved).")
+        spark.sql(f"DELETE FROM {table_fqn} WHERE genie_space_id = '{GENIE_SPACE_ID}'")
+        sdf.write.mode("append").option("mergeSchema", "true").saveAsTable(table_fqn)
 
 
 final_sdf = (
@@ -1302,6 +1349,11 @@ def run_one_genie(question: str) -> dict:
         if sid:
             try:
                 stmt = w.statement_execution.get_statement(sid)
+                _st = getattr(getattr(stmt.status, "state", None), "value", None) if stmt.status else None
+                if _st and _st != "SUCCEEDED":
+                    # FAILED/EXPIRED/CLOSED statements would read as "Genie returned nothing"
+                    # and score a hard miss; they are capture failures, not wrong answers.
+                    raise RuntimeError(f"genie statement state={_st}")
                 rows = _collect_statement_rows(sid, stmt.result, row_cap=50)
             except Exception as e:
                 # Result-capture failure ≠ Genie answered wrong: surface it as an error so the
@@ -1388,6 +1440,11 @@ def _cells_close(a: str, b: str) -> bool:
     semantically identical SQL (caught live: 16.67 vs 16.666666… scored as a miss)."""
     if a == b:
         return True
+    # Tolerance is for ROUND()/float-path differences — it only applies when a side has a
+    # fractional part. Integer-valued cells (counts, IDs) must match EXACTLY: the old behavior
+    # bridged 999 vs 1000 at any scale >= 999 (cold-review board).
+    if "." not in a and "." not in b:
+        return False
     try:
         da, db = _Decimal(a), _Decimal(b)
     except Exception:
@@ -1405,10 +1462,6 @@ def _match_with_permutation(E, G, tolerant: bool) -> bool:
     pass (e.g. [[1,2],[3,4]] vs [[2,1],[3,4]]) — a false PASS inflates the lower bound."""
     from itertools import permutations as _perms
     ncols = len(E[0])
-    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
-        return False
-    if ncols > 7:  # 8!+ permutations — fall back to legacy sorted-cell multiset (lenient)
-        return _Counter(tuple(sorted(r)) for r in E) == _Counter(tuple(sorted(r)) for r in G)
     ce = _Counter(E)
     for p in _perms(range(ncols)):
         Gp = [tuple(g[i] for i in p) for g in G]
@@ -1457,9 +1510,19 @@ def rows_match(expected_rows, genie_rows, row_cap: int = 50):
     if len(E) != len(G):
         return False
     if not E:
-        return True   # both empty result sets
+        # Both empty: uninformative — two unrelated wrong queries that each return nothing must
+        # not count as agreement (cold-review board). Excluded from the rate.
+        return None
     if _Counter(E) == _Counter(G):
-        return True   # fast path: same column order
+        return True   # fast path: same column order (safe at any width)
+    ncols = len(E[0])
+    if any(len(r) != ncols for r in E) or any(len(r) != ncols for r in G):
+        return False
+    if ncols > 7:
+        # Permutation search is infeasible past 7 columns and the old sorted-cell fallback
+        # admitted false PASSes (inconsistent cross-column swaps). Wide results that don't
+        # match in-order are NOT-EVALUABLE rather than leniently matched.
+        return None
     if _match_with_permutation(E, G, tolerant=False):
         return True
     return _match_with_permutation(E, G, tolerant=True)
@@ -1471,7 +1534,10 @@ def rows_match(expected_rows, genie_rows, row_cap: int = 50):
 # pass for downstream tables; the others feed only the reliability phase (8.5).
 from concurrent.futures import ThreadPoolExecutor
 
-eval_pub_pdf = spark.table(EVAL_SET_TABLE).toPandas()
+# Scope to THIS space: the table holds every space's rows (per-space replaceWhere writes).
+# An unfiltered read ran foreign spaces' questions against this Genie AND poisoned the
+# scoped write downstream (cold-review board, critical).
+eval_pub_pdf = spark.table(EVAL_SET_TABLE).where(F.col("genie_space_id") == GENIE_SPACE_ID).toPandas()
 N_questions = len(eval_pub_pdf)
 print(f"Running {N_questions} eval questions × {STABILITY_RUNS} rerun(s) against Genie space {GENIE_SPACE_ID}...")
 
@@ -1693,7 +1759,8 @@ if STABILITY_RUNS >= 2:
     rerun_agreement = (unanimous / judgeable) if judgeable else float("nan")
 
     # --- Question-level concordance + Wilson CI on N INDEPENDENT units ---
-    # Unit = question (NOT N×M correlated cells). A question "passes" if its mean rerun pass ≥ 0.5.
+    # Unit = question (NOT N×M correlated cells). A question "passes" only if its mean rerun
+    # pass is STRICTLY > 0.5 — an even split counts as fail (conservative).
     n_units = len(q_pass)
     passes = sum(1 for p in q_pass if p > 0.5)  # even split = fail (conservative lower bound)
     pooled_p = (passes / n_units) if n_units else 0.0
@@ -1730,7 +1797,8 @@ if STABILITY_RUNS >= 2:
         mlflow.log_param("M_reruns", STABILITY_RUNS)
         mlflow.log_param("N_questions", N_questions)
         mlflow.log_metric("n_units", n_units)
-        mlflow.log_metric("pooled_pass_rate", pooled_p)
+        if n_units:  # 0 units = nothing measured; logging 0.0 would render as a real rate
+            mlflow.log_metric("pooled_pass_rate", pooled_p)
         if not np.isnan(rerun_agreement):
             mlflow.log_metric("rerun_agreement", rerun_agreement)
         mlflow.log_metric("ci95_low", ci_low)
@@ -1927,7 +1995,7 @@ else:
 
 # COMMAND ----------
 
-final_sdf = spark.table(EVAL_SET_TABLE)
+final_sdf = spark.table(EVAL_SET_TABLE).where(F.col("genie_space_id") == GENIE_SPACE_ID)
 summary = (
     final_sdf.groupBy("category")
     .agg(

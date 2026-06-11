@@ -106,6 +106,9 @@ def health() -> dict:
         "authed": bool(get_host() and sp_token),
         "notebook_path": get_notebook_path(),
         "obo_dev_fallback": bool(os.environ.get("DEV_USER_TOKEN")),
+        # Set by the DAB (resources/app.yml) from --var=output_catalog; the form uses it as the
+        # uc_catalog default so eval tables land in the catalog the bundle prepared.
+        "default_output_catalog": os.environ.get("DEFAULT_OUTPUT_CATALOG", ""),
     }
 
 

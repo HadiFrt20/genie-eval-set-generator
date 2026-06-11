@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixes from an independent zero-context review board
+
+A panel of fresh-eyes reviewers and adversaries (no prior context, public repo only) audited the
+project; every confirmed finding below is fixed in this release.
+
+- **Cross-space data destruction path (critical):** the Genie-regression phase read the eval table
+  WITHOUT filtering by space, so on a shared catalog it ran other spaces' questions against this
+  space's Genie — and the scoped write's failure fallback then performed a full-table overwrite,
+  destroying other spaces' history. The read is now space-scoped, and the write fallback is
+  delete-this-space + append (never a full overwrite). The per-category summary is space-scoped too.
+- **Deploy shipped the app without its UI (critical):** the built frontend is gitignored and DAB sync
+  respects `.gitignore`, so `bundle deploy` uploaded an app whose UI was a "Frontend build not found"
+  error. `databricks.yml` now explicitly syncs `app/server/static/**`.
+- **Matcher false-PASS channels (critical):** (1) the 0.1% numeric tolerance could bridge distinct
+  integer values from 999 upward (a COUNT off by one matched) — tolerance now applies only to
+  fractional values, integer cells must match exactly; (2) results wider than 7 columns silently fell
+  back to per-row sorted-cell matching, re-admitting the cross-column-swap false PASS the changelog
+  previously claimed eliminated — wide results that don't match in column order are now NOT-EVALUABLE
+  (the earlier claim was over-broad and is hereby corrected); (3) two empty result sets counted as
+  agreement — now NOT-EVALUABLE.
+- **Leakage flag blind to partial leakage:** flag now fires on the FRACTION of near-verbatim questions
+  (≥10% with NN cosine ≥ 0.97) instead of the mean, which hid 30%-verbatim sets; `leakage_fraction`
+  is logged alongside.
+- Robustness: generator items are normalized before use (a single malformed LLM item could crash the
+  run); truncated generator JSON raises a diagnostic error instead of a bare parse crash; only
+  SELECT/WITH statements are executed (an LLM-emitted DML/DDL statement would have run with the
+  runner's grants); Genie statement state is checked (FAILED/EXPIRED results no longer score as
+  misses); `pooled_pass_rate` is not logged when zero units were measured; `CREATE SCHEMA` is
+  backticked and blank catalog/schema fail fast.
+- App/deploy: the bundle's `--var=output_catalog` now actually reaches the form (`/api/health`
+  exposes it; the Configure page prefers it over the space's data catalog); the questions-per-table
+  form cap (80) no longer blocks the documented 100+ gating config (now 300); the bundled MLflow
+  experiment matches the notebook's default path; the workspace probe's deep row-match check was
+  silently disabled by a stale import (now fixed, and import failures are loud); the judge-calibration
+  harness marks single-class human labels "not calibratable" instead of awarding κ=1.0.
+- README: positions the tool relative to Genie's built-in Benchmarks feature (complement, not
+  replacement; fleet-scale audience named); matcher semantics described precisely (integer-exact
+  tolerance, wide-result and empty-result carve-outs); realism explicitly listed as not-yet-measured;
+  gating-run cost/time and space-history side effects disclosed; roadmap A/B numbers annotated with
+  their provenance and reproducibility plan.
+
 ### Verification-driven fixes (post-release reviews + live A/B experiments)
 
 - **Matcher v2** (`rows_match`): column-order/alias invariance is now ONE consistent column permutation
