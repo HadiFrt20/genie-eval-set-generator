@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Generation robustness (live context-parity experiments)
+
+Three live experiments on instruction-bearing spaces surfaced four generation failure classes,
+all now fixed:
+- **Relative-time questions are rejected deterministically** — "this month" / CURRENT_DATE pairs
+  are unverifiable and unstable by construction; curated few-shot kept re-introducing them despite
+  prompt rules (measured twice), so a post-check enforces it.
+- **Determinism double-execution** at validation: queries whose own re-execution differs (LIMIT
+  without ORDER BY, sampling, drifting data) are flagged `sql_deterministic=false` and excluded
+  from the Genie regression.
+- **SELECT-based table pruning** — DESCRIBE can succeed where SELECT is denied (BROWSE-style
+  grants); such tables previously generated questions whose every expected_sql failed.
+- **Date-range introspection** — MIN/MAX per date/timestamp column now feeds the literal-date
+  rule (date columns are never low-cardinality, so the generator had no dates to anchor to).
+Measured outcome: on an instruction-rich space, 11/12 generated pairs were deterministic and
+8/11 survived independent round-trip verification — and giving the verifier the space's declared
+semantics (context parity) produced identical results, supporting the roadmap's verification
+design on navigational-instruction spaces.
+
+
 ### Fixes from an independent zero-context review board
 
 A panel of fresh-eyes reviewers and adversaries (no prior context, public repo only) audited the
